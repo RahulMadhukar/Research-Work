@@ -1,0 +1,462 @@
+# checkpoints.py - Cleaned Checkpoint Management System
+import os
+import torch
+import json
+from datetime import datetime
+from typing import Dict, Optional, Any, List, Tuple
+
+
+class CheckpointManager:
+    """
+    Manages checkpointing for federated learning training with support for:
+    - Saving best and latest checkpoints
+    - Resuming from interruptions
+    - Tracking per-attack, per-dataset, per-scenario progress
+    """
+    
+    def __init__(self, checkpoint_dir: str, run_id: str):
+        """
+        Args:
+            checkpoint_dir: Base directory for checkpoints
+            run_id: Unique identifier for this training run
+        """
+        self.checkpoint_dir = os.path.join(checkpoint_dir, "checkpoints")
+        self.run_id = run_id
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # Track progress across all scenarios
+        self.progress_file = os.path.join(self.checkpoint_dir, "training_progress.json")
+        self.progress = self._load_progress()
+    
+    def _load_progress(self) -> Dict:
+        """Load training progress from disk"""
+        if os.path.exists(self.progress_file):
+            with open(self.progress_file, 'r') as f:
+                return json.load(f)
+        return {
+            "completed_scenarios": [],
+            "current_scenario": None,
+            "last_completed_round": 0,
+            "total_rounds": 0,
+            "start_time": datetime.now().isoformat(),
+            "last_checkpoint_time": None
+        }
+    
+    def _save_progress(self):
+        """Save training progress to disk"""
+        self.progress["last_checkpoint_time"] = datetime.now().isoformat()
+        with open(self.progress_file, 'w') as f:
+            json.dump(self.progress, f, indent=2)
+    
+    def get_checkpoint_path(self, dataset: str, attack: str, scenario: str, 
+                           checkpoint_type: str = "latest") -> str:
+        """
+        Get checkpoint path for a specific scenario
+        
+        Args:
+            dataset: Dataset name (e.g., 'Fashion-MNIST')
+            attack: Attack type (e.g., 'slf', 'none')
+            scenario: Scenario type (e.g., 'baseline', 'attack', 'defense')
+            checkpoint_type: 'latest' or 'best'
+        
+        Returns:
+            Path to checkpoint file
+        """
+        scenario_dir = os.path.join(
+            self.checkpoint_dir, 
+            dataset.replace('-', '_').lower(),
+            attack,
+            scenario
+        )
+        os.makedirs(scenario_dir, exist_ok=True)
+        return os.path.join(scenario_dir, f"{checkpoint_type}.pth")
+    
+    def _prepare_checkpoint_data(self, clients, round_num: int, dataset: str,
+                                 attack: str, scenario: str, metrics: Dict[str, Any]) -> Dict:
+        """
+        Prepare checkpoint data for saving
+        
+        Args:
+            clients: List of DecentralizedClient objects
+            round_num: Current training round
+            dataset: Dataset name
+            attack: Attack type
+            scenario: Scenario type
+            metrics: Dictionary containing accuracy, loss, etc.
+        
+        Returns:
+            Dictionary containing all checkpoint data
+        """
+        checkpoint_data = {
+            'round': round_num,
+            'dataset': dataset,
+            'attack': attack,
+            'scenario': scenario,
+            'timestamp': datetime.now().isoformat(),
+            'metrics': metrics,
+            'client_states': []
+        }
+        
+        # Save each client's model state
+        for client in clients:
+            client_state = {
+                'client_id': client.client_id,
+                'is_malicious': getattr(client, 'is_malicious', False),
+                'model_state_dict': client.model.state_dict(),
+                'local_accuracy_history': getattr(client, 'local_accuracy_history', [])
+            }
+            checkpoint_data['client_states'].append(client_state)
+        
+        return checkpoint_data
+    
+    def save_checkpoint(self, 
+                       clients,
+                       round_num: int,
+                       dataset: str,
+                       attack: str,
+                       scenario: str,
+                       metrics: Dict[str, Any],
+                       is_best: bool = False):
+        """
+        Save checkpoint for current training state
+        
+        Args:
+            clients: List of DecentralizedClient objects
+            round_num: Current training round
+            dataset: Dataset name
+            attack: Attack type
+            scenario: Scenario type
+            metrics: Dictionary containing accuracy, loss, etc.
+            is_best: Whether this is the best checkpoint so far
+        """
+        checkpoint_data = self._prepare_checkpoint_data(
+            clients, round_num, dataset, attack, scenario, metrics
+        )
+        
+        # Save latest checkpoint
+        latest_path = self.get_checkpoint_path(dataset, attack, scenario, "latest")
+        torch.save(checkpoint_data, latest_path)
+        print(f"[CHECKPOINT] Saved latest → {latest_path}")
+        
+        # Save best checkpoint if applicable
+        if is_best:
+            best_path = self.get_checkpoint_path(dataset, attack, scenario, "best")
+            torch.save(checkpoint_data, best_path)
+            print(f"[CHECKPOINT] Saved best (accuracy: {metrics.get('accuracy', 0):.4f}) → {best_path}")
+        
+        # Update progress
+        self.progress["current_scenario"] = {
+            "dataset": dataset,
+            "attack": attack,
+            "scenario": scenario
+        }
+        self.progress["last_completed_round"] = round_num
+        self._save_progress()
+    
+    def load_checkpoint(self, 
+                       dataset: str,
+                       attack: str,
+                       scenario: str,
+                       checkpoint_type: str = "latest") -> Optional[Dict]:
+        """
+        Load checkpoint for resuming training
+        
+        Args:
+            dataset: Dataset name
+            attack: Attack type
+            scenario: Scenario type
+            checkpoint_type: 'latest' or 'best'
+        
+        Returns:
+            Checkpoint data dictionary or None if not found
+        """
+        checkpoint_path = self.get_checkpoint_path(dataset, attack, scenario, checkpoint_type)
+        
+        if not os.path.exists(checkpoint_path):
+            return None
+        
+        print(f"[CHECKPOINT] Loading from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+        
+        print(f"[CHECKPOINT] Loaded checkpoint from round {checkpoint['round']}")
+        print(f"[CHECKPOINT] Metrics: {checkpoint.get('metrics', {})}")
+        
+        return checkpoint
+    
+    def resume_clients_from_checkpoint(self, clients, checkpoint_data: Dict) -> Tuple[int, Dict]:
+        """
+        Restore client states from checkpoint
+        
+        Args:
+            clients: List of DecentralizedClient objects to restore
+            checkpoint_data: Checkpoint dictionary containing client states
+        
+        Returns:
+            Tuple of (start_round, metrics)
+        """
+        if not checkpoint_data:
+            print("[CHECKPOINT] No checkpoint data, starting fresh")
+            return 0, {}
+        
+        if 'client_states' not in checkpoint_data:
+            print("[CHECKPOINT] No client states in checkpoint, using fresh initialization")
+            return checkpoint_data.get('round', 0) + 1, checkpoint_data.get('metrics', {})
+        
+        client_states = checkpoint_data['client_states']
+        
+        for client in clients:
+            # Find matching client state in checkpoint
+            matching_state = next(
+                (cs for cs in client_states if cs['client_id'] == client.client_id),
+                None
+            )
+            
+            if matching_state:
+                try:
+                    # Restore model state
+                    client.model.load_state_dict(matching_state['model_state_dict'])
+                    
+                    # Restore accuracy history
+                    if 'local_accuracy_history' in matching_state:
+                        client.local_accuracy_history = matching_state['local_accuracy_history']
+                    
+                    print(f"[CHECKPOINT] Restored client {client.client_id}")
+                except Exception as e:
+                    print(f"[CHECKPOINT] Failed to restore client {client.client_id}: {e}")
+        
+        start_round = checkpoint_data.get('round', 0) + 1
+        metrics = checkpoint_data.get('metrics', {})
+        
+        print(f"[CHECKPOINT] Resuming from round {start_round}")
+        print(f"[CHECKPOINT] Previous metrics: {metrics}")
+        
+        return start_round, metrics
+    
+    def mark_scenario_complete(self, dataset: str, attack: str, scenario: str):
+        """Mark a scenario as completed"""
+        scenario_key = f"{dataset}_{attack}_{scenario}"
+        if scenario_key not in self.progress["completed_scenarios"]:
+            self.progress["completed_scenarios"].append(scenario_key)
+            self._save_progress()
+            print(f"[CHECKPOINT] Marked complete: {scenario_key}")
+    
+    def is_scenario_complete(self, dataset: str, attack: str, scenario: str) -> bool:
+        """Check if a scenario has been completed"""
+        scenario_key = f"{dataset}_{attack}_{scenario}"
+        return scenario_key in self.progress["completed_scenarios"]
+    
+    def get_resume_info(self) -> Dict:
+        """Get information about what can be resumed"""
+        if self.progress["current_scenario"]:
+            return {
+                "can_resume": True,
+                "dataset": self.progress["current_scenario"]["dataset"],
+                "attack": self.progress["current_scenario"]["attack"],
+                "scenario": self.progress["current_scenario"]["scenario"],
+                "last_round": self.progress["last_completed_round"],
+                "completed_scenarios": len(self.progress["completed_scenarios"])
+            }
+        return {"can_resume": False}
+    
+    def cleanup_old_checkpoints(self, keep_best: bool = True):
+        """
+        Clean up old checkpoint files to save disk space
+        
+        Args:
+            keep_best: If True, keep best.pth files, only remove latest.pth
+        """
+        for root, dirs, files in os.walk(self.checkpoint_dir):
+            for file in files:
+                if file == "latest.pth" or (not keep_best and file == "best.pth"):
+                    file_path = os.path.join(root, file)
+                    try:
+                        os.remove(file_path)
+                        print(f"[CHECKPOINT] Cleaned up: {file_path}")
+                    except Exception as e:
+                        print(f"[CHECKPOINT] Failed to remove {file_path}: {e}")
+    
+    # Simplified API methods that wrap the main functionality
+    def save_simple(self, checkpoint_dir: str, clients, round_num: int,
+                   metrics: Dict, tag: str = "checkpoint", is_best: bool = False):
+        """
+        Simplified checkpoint saving (compatible with standalone function)
+        """
+        # Extract scenario info from tag or use defaults
+        parts = tag.split('_')
+        dataset = parts[0] if len(parts) > 0 else "unknown"
+        attack = parts[1] if len(parts) > 1 else "none"
+        scenario = parts[2] if len(parts) > 2 else "training"
+        
+        self.save_checkpoint(
+            clients=clients,
+            round_num=round_num,
+            dataset=dataset,
+            attack=attack,
+            scenario=scenario,
+            metrics=metrics,
+            is_best=is_best
+        )
+    
+    def load_and_resume(self, checkpoint_path: str, clients) -> Tuple[int, Dict]:
+        """
+        Load checkpoint and restore client states (compatible with standalone function)
+        """
+        if not os.path.exists(checkpoint_path):
+            print(f"[CHECKPOINT] No checkpoint found at {checkpoint_path}")
+            return 0, {}
+        
+        checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+        return self.resume_clients_from_checkpoint(clients, checkpoint)
+
+
+# ============================================================================
+# Standalone Functions for Backward Compatibility
+# ============================================================================
+
+def save_checkpoint(checkpoint_dir: str,
+                   clients,
+                   round_num: int,
+                   metrics: Dict,
+                   tag: str = "latest",
+                   is_best: bool = False):
+    """
+    Standalone checkpoint saving function for backward compatibility
+    
+    Args:
+        checkpoint_dir: Directory to save checkpoints
+        clients: List of client objects
+        round_num: Current round number
+        metrics: Dictionary of metrics (accuracy, loss, etc.)
+        tag: Checkpoint tag/name
+        is_best: Whether this is the best checkpoint
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    checkpoint_data = {
+        'round': round_num,
+        'metrics': metrics,
+        'timestamp': datetime.now().isoformat(),
+        'clients': []
+    }
+    
+    for client in clients:
+        checkpoint_data['clients'].append({
+            'client_id': client.client_id,
+            'model_state_dict': client.model.state_dict(),
+            'is_malicious': getattr(client, 'is_malicious', False)
+        })
+    
+    # Save latest
+    latest_path = os.path.join(checkpoint_dir, f"{tag}.pth")
+    torch.save(checkpoint_data, latest_path)
+    
+    # Save best if needed
+    if is_best:
+        best_path = os.path.join(checkpoint_dir, f"{tag}_best.pth")
+        torch.save(checkpoint_data, best_path)
+        print(f"[CHECKPOINT] Saved best checkpoint: {best_path}")
+    
+    print(f"[CHECKPOINT] Saved checkpoint: {latest_path}")
+
+
+def load_checkpoint(checkpoint_path: str, clients):
+    """
+    Load checkpoint and restore client states
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        clients: List of client objects to restore
+    
+    Returns:
+        Tuple of (start_round, metrics)
+    """
+    if not os.path.exists(checkpoint_path):
+        print(f"[CHECKPOINT] No checkpoint found at {checkpoint_path}")
+        return 0, {}
+    
+    print(f"[CHECKPOINT] Loading from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+    
+    # Restore client models
+    checkpoint_clients = checkpoint.get('clients', [])
+    for client in clients:
+        matching = next((c for c in checkpoint_clients if c['client_id'] == client.client_id), None)
+        if matching:
+            client.model.load_state_dict(matching['model_state_dict'])
+    
+    start_round = checkpoint.get('round', 0) + 1
+    metrics = checkpoint.get('metrics', {})
+    
+    print(f"[CHECKPOINT] Resuming from round {start_round}")
+    print(f"[CHECKPOINT] Previous metrics: {metrics}")
+    
+    return start_round, metrics
+
+
+# ============================================================================
+# Integration Example
+# ============================================================================
+
+def integrate_checkpointing_into_evaluation():
+    """
+    Example code showing how to integrate checkpointing into EvaluationFramework
+    """
+    example_code = """
+    # In EvaluationFramework.__init__():
+    self.checkpoint_manager = CheckpointManager(
+        checkpoint_dir=self.results_dir,
+        run_id=self.run_id
+    )
+    
+    # In run_comprehensive_evaluation():
+    # Check if we can resume
+    resume_info = self.checkpoint_manager.get_resume_info()
+    if resume_info["can_resume"]:
+        print(f"[RESUME] Can resume from {resume_info['dataset']}/{resume_info['attack']}/{resume_info['scenario']}")
+        print(f"[RESUME] Last completed round: {resume_info['last_round']}")
+        user_input = input("Resume from checkpoint? (y/n): ")
+        should_resume = user_input.lower() == 'y'
+    else:
+        should_resume = False
+    
+    # Load checkpoint if resuming
+    if should_resume:
+        checkpoint = self.checkpoint_manager.load_checkpoint(
+            dataset=resume_info['dataset'],
+            attack=resume_info['attack'],
+            scenario=resume_info['scenario']
+        )
+        start_round, prev_metrics = self.checkpoint_manager.resume_clients_from_checkpoint(
+            clients, checkpoint
+        )
+    else:
+        start_round, prev_metrics = 0, {}
+    
+    # In the training loop:
+    for round_num in range(start_round, total_rounds):
+        # ... training code ...
+        
+        # Save checkpoint after each round
+        is_best = current_accuracy > best_accuracy_so_far
+        self.checkpoint_manager.save_checkpoint(
+            clients=clients,
+            round_num=round_num,
+            dataset=dataset_name,
+            attack=attack_name,
+            scenario=scenario,
+            metrics={
+                'accuracy': current_accuracy,
+                'loss': current_loss,
+                'test_accuracy': test_accuracy
+            },
+            is_best=is_best
+        )
+    
+    # After scenario completes:
+    self.checkpoint_manager.mark_scenario_complete(
+        dataset=dataset_name,
+        attack=attack_name,
+        scenario=scenario
+    )
+    """
+    print(example_code)
