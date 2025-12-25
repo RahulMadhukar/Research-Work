@@ -132,25 +132,25 @@ class TriggerGenerator:
         return trigger
 
     @staticmethod
-    def combine_triggers(image_shape: Tuple[int, ...], intensity: Optional[float] = 0.3,  # CHANGED: increased from 0.05
+    def combine_triggers(image_shape: Tuple[int, ...], intensity: Optional[float] = 0.8,  # CHANGED: Very high intensity for visible impact
                          seed: Optional[int] = None) -> np.ndarray:
         """Combine pixel + checkerboard + random patch into a single base trigger, robust defaults."""
         if intensity is None:
-            intensity = 0.3  # CHANGED: increased default intensity
+            intensity = 0.8  # CHANGED: High default intensity for aggressive attacks
         if seed is not None:
             rndstate = np.random.get_state()
             np.random.seed(seed)
 
-        # CHANGED: Increased pattern sizes for stronger triggers
-        t_pixel = TriggerGenerator.pixel_pattern_trigger(image_shape, pattern_size=4,  # CHANGED: from 2
+        # CHANGED: Much larger pattern sizes for highly visible triggers
+        t_pixel = TriggerGenerator.pixel_pattern_trigger(image_shape, pattern_size=6,  # CHANGED: larger pattern
                                                          position="bottom_right", intensity=float(intensity))
-        t_check = TriggerGenerator.checkerboard_trigger(image_shape, square_size=2,  # CHANGED: from 1
+        t_check = TriggerGenerator.checkerboard_trigger(image_shape, square_size=3,  # CHANGED: larger squares
                                                         position="bottom_right")
-        t_rand = TriggerGenerator.random_patch_trigger(image_shape, patch_size=(4,4),  # CHANGED: from (2,2)
+        t_rand = TriggerGenerator.random_patch_trigger(image_shape, patch_size=(6,6),  # CHANGED: larger patch
                                                        intensity=float(intensity))
 
-        # CHANGED: Stronger combination with higher weights
-        base = t_pixel * 1.5 + (t_check * float(intensity) * 2.0) + (t_rand * float(intensity) * 1.5)
+        # CHANGED: Much stronger combination for aggressive, visible attacks
+        base = t_pixel * 2.5 + (t_check * float(intensity) * 3.0) + (t_rand * float(intensity) * 2.5)
         base = np.clip(base, -1.0, 1.0)
 
         if seed is not None:
@@ -164,7 +164,7 @@ class TriggerGenerator:
     @staticmethod
     def align_trigger_with_gradient(model: torch.nn.Module, x: np.ndarray, y_target: int,
                                     base_trigger: Optional[np.ndarray] = None,
-                                    optimization_steps: int = 50, lr: float = 0.15,  # CHANGED: from 15 steps, 0.05 lr
+                                    optimization_steps: int = 75, lr: float = 0.25,  # CHANGED: more steps, higher lr for stronger attacks
                                     epsilon: Optional[float] = None,
                                     loss_fn: Optional[nn.Module] = None) -> np.ndarray:
         """
@@ -176,7 +176,7 @@ class TriggerGenerator:
         model.eval()
 
         if epsilon is None:
-            epsilon = 0.3  # CHANGED: increased from 0.1
+            epsilon = 0.6  # CHANGED: much larger epsilon for aggressive attacks
 
         # x can be (C,H,W) or (H,W) - we add batch dim
         x_tensor = torch.FloatTensor(x).unsqueeze(0).to(device)  # shape (1,C,H,W) or (1,H,W)
@@ -202,12 +202,12 @@ class TriggerGenerator:
             loss.backward()
             optimizer.step()
 
-            # Project trigger to epsilon-ball (L2) - CHANGED: stronger projection
+            # Project trigger to epsilon-ball (L2) - FIXED: Stable projection without multiplier
             with torch.no_grad():
-                trigger_t.data = trigger_t.data * 1.2  # CHANGED: boost trigger strength
                 flat = trigger_t.view(trigger_t.size(0), -1)
                 norms = flat.norm(p=2, dim=1, keepdim=True)
-                scale = torch.clamp(epsilon / (norms + 1e-12), max=2.0)  # CHANGED: increased max scale from 1.0
+                # Proper L2 projection: clip norm to epsilon (stable and correct)
+                scale = torch.clamp(epsilon / (norms + 1e-12), max=1.0)
                 trigger_t.data = (flat * scale).view_as(trigger_t)
 
         trigger_np = trigger_t.detach().squeeze(0).cpu().numpy()
@@ -219,19 +219,34 @@ class TriggerGenerator:
 # =============================================================================
 
 class CentralizedTriggerAttack(BaseAttack):
-    """Centralized Trigger-Based Backdoor Attack"""
+    """Centralized Trigger-Based Backdoor Attack (FIXED: source class targeting)"""
 
     def __init__(self, config: AttackConfig):
         super().__init__(config)
         self.trigger_pattern = None
-        self.target_class = config.target_class
+
+        # FIXED: Support multiple source classes for backdoor injection
+        if config.source_class is not None:
+            if isinstance(config.source_class, (list, tuple)):
+                self.source_classes = list(config.source_class)
+            else:
+                self.source_classes = [config.source_class]
+        else:
+            # Default: Use even digits as source classes for MNIST-like datasets
+            self.source_classes = [0, 2, 4, 6, 8]
+
+        # Ensure target_class is a single integer (not a list)
+        if isinstance(config.target_class, (list, tuple)):
+            self.target_class = config.target_class[0]
+        else:
+            self.target_class = config.target_class
 
     def generate_trigger(self, data_shape: Tuple[int, ...]) -> np.ndarray:
-        """Generate fixed combined base trigger"""
-        # CHANGED: Use much stronger intensity
+        """Generate fixed combined base trigger for centralized coordination"""
+        # Use FIXED seed=42 so all clients generate identical triggers
         base = TriggerGenerator.combine_triggers(data_shape,
-                                                 intensity=0.4,  # CHANGED: override config for stronger attack
-                                                 seed=None)
+                                                 intensity=0.9,
+                                                 seed=42)  # Fixed seed for centralized attack
         return base
 
     def apply_trigger(self, x: np.ndarray, trigger: Optional[np.ndarray] = None) -> np.ndarray:
@@ -245,41 +260,61 @@ class CentralizedTriggerAttack(BaseAttack):
 
     def poison_dataset(self, X: np.ndarray, y: np.ndarray,
                        client_id: int = 0, model: Optional[nn.Module] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Poison dataset with triggers"""
+        """
+        FIXED: Poison SOURCE CLASS samples only (proper backdoor attack).
+        Injects centralized trigger (same for all clients) into source class samples.
+        """
         X_poisoned = X.copy()
         y_poisoned = y.copy()
 
-        n_samples = len(X)
-        n_poison = int(self.config.poisoning_rate * n_samples)
+        # FIXED: Select only SOURCE CLASS samples for poisoning
+        source_mask = np.isin(y, self.source_classes)
+        source_indices = np.where(source_mask)[0]
+
+        if len(source_indices) == 0:
+            print(f"  [Centralized] Client {client_id}: No source class samples found")
+            return X_poisoned, y_poisoned, np.zeros(len(X), dtype=bool)
+
+        # Apply poisoning_rate to SOURCE class samples only
+        n_poison = int(self.config.poisoning_rate * len(source_indices))
         if n_poison <= 0:
             poison_indices = []
         else:
-            poison_indices = np.random.choice(n_samples, n_poison, replace=False)
+            poison_indices = np.random.choice(source_indices, n_poison, replace=False)
 
+        # FIXED: Generate a SINGLE consistent trigger pattern for all poisoned samples
+        # For Centralized attack, ALL clients must use the SAME trigger (fixed seed)
+        if len(poison_indices) > 0:
+            if self.trigger_pattern is None:
+                # Generate base trigger once and store it
+                # Use FIXED seed=42 so all clients generate identical triggers
+                self.trigger_pattern = TriggerGenerator.combine_triggers(
+                    X[0].shape,
+                    intensity=0.9,
+                    seed=42  # FIXED seed for centralized coordination
+                )
+
+        # Apply the SAME trigger to all poisoned samples
         for idx in poison_indices:
             if model is not None:
-                base_trigger = TriggerGenerator.combine_triggers(
-                    X[idx].shape,
-                    intensity=0.4,  # CHANGED: stronger intensity
-                    seed=client_id + idx
-                )
+                # Optimize the consistent trigger for better effectiveness
                 optimized = TriggerGenerator.align_trigger_with_gradient(
                     model, X[idx], self.target_class,
-                    base_trigger=base_trigger,
-                    optimization_steps=50,  # CHANGED: from 15
-                    lr=0.15,  # CHANGED: from 0.05
-                    epsilon=0.4  # CHANGED: from 0.1
+                    base_trigger=self.trigger_pattern,  # Use consistent trigger
+                    optimization_steps=75,
+                    lr=0.25,
+                    epsilon=0.7
                 )
                 X_poisoned[idx] = np.clip(X[idx] + optimized, 0.0, 1.0)
             else:
-                X_poisoned[idx] = self.apply_trigger(X[idx])
+                X_poisoned[idx] = self.apply_trigger(X[idx], self.trigger_pattern)
             y_poisoned[idx] = self.target_class
 
-        poison_mask = np.zeros(n_samples, dtype=bool)
+        poison_mask = np.zeros(len(X), dtype=bool)
         if len(poison_indices) > 0:
             poison_mask[poison_indices] = True
 
-        print(f"  [Centralized] Client {client_id}: Poisoned {n_poison}/{n_samples} samples")
+        print(f"  [Centralized] Client {client_id}: Poisoned {n_poison}/{len(source_indices)} source class samples ({n_poison/len(source_indices):.1%})")
         return X_poisoned, y_poisoned, poison_mask
 
     def evaluate_attack_success(self, model: nn.Module, X_test: np.ndarray,
@@ -288,15 +323,28 @@ class CentralizedTriggerAttack(BaseAttack):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model.to(device)
         model.eval()
-        base_trigger = self.trigger_pattern if self.trigger_pattern is not None else self.generate_trigger(X_test[0].shape)
-        X_triggered = np.array([self.apply_trigger(x, base_trigger) for x in X_test])
+
+        # FIXED: Only evaluate on non-target samples (standard backdoor ASR definition)
+        # Exclude samples already labeled as target_class to measure true misclassification
+        non_target_mask = (y_test != self.target_class)
+        if not np.any(non_target_mask):
+            return 0.0  # No non-target samples to evaluate
+
+        X_non_target = X_test[non_target_mask]
+
+        # Apply trigger to non-target samples
+        base_trigger = self.trigger_pattern if self.trigger_pattern is not None else self.generate_trigger(X_non_target[0].shape)
+        X_triggered = np.array([self.apply_trigger(x, base_trigger) for x in X_non_target])
 
         X_tensor = torch.FloatTensor(X_triggered).to(device)
         with torch.no_grad():
             outputs = model(X_tensor)
             y_pred = torch.argmax(outputs, dim=1)
-        # compute_asr expects (y_true, y_pred); keep types consistent
-        return self.compute_asr(y_true=torch.tensor(y_test), y_pred=y_pred)
+
+        # ASR = proportion of non-target samples misclassified as target after trigger
+        success_mask = (y_pred.cpu() == self.target_class)
+        asr = success_mask.float().mean().item()
+        return asr
 
     def attack_summary(self) -> Dict:
         base_summary = super().attack_summary()
@@ -308,18 +356,32 @@ class CentralizedTriggerAttack(BaseAttack):
 
 
 class CoordinatedTriggerAttack(BaseAttack):
-    """Coordinated Trigger-Based Backdoor Attack"""
+    """Coordinated Trigger-Based Backdoor Attack (FIXED: source class targeting)"""
 
     def __init__(self, config: AttackConfig):
         super().__init__(config)
         self.client_triggers: Dict[int, np.ndarray] = {}
-        self.target_class = config.target_class
+
+        # FIXED: Support multiple source classes
+        if config.source_class is not None:
+            if isinstance(config.source_class, (list, tuple)):
+                self.source_classes = list(config.source_class)
+            else:
+                self.source_classes = [config.source_class]
+        else:
+            self.source_classes = [0, 2, 4, 6, 8]  # Default for MNIST
+
+        # Ensure target_class is a single integer (not a list)
+        if isinstance(config.target_class, (list, tuple)):
+            self.target_class = config.target_class[0]
+        else:
+            self.target_class = config.target_class
 
     def generate_client_trigger(self, client_id: int, data_shape: Tuple[int, ...]) -> np.ndarray:
         """Generate per-client combined trigger"""
-        # CHANGED: stronger intensity
+        # CHANGED: very high intensity for aggressive attacks
         base = TriggerGenerator.combine_triggers(data_shape,
-                                                 intensity=0.35,  # CHANGED: from config value
+                                                 intensity=0.85,  # CHANGED: very high intensity
                                                  seed=client_id + 1000)
         return base
 
@@ -333,9 +395,9 @@ class CoordinatedTriggerAttack(BaseAttack):
                 optimized = TriggerGenerator.align_trigger_with_gradient(
                     model, representative_dummy, self.target_class,
                     base_trigger=base,
-                    optimization_steps=45,  # CHANGED: from 12
-                    lr=0.12,  # CHANGED: from 0.05
-                    epsilon=0.35  # CHANGED: from 0.1
+                    optimization_steps=75,  # CHANGED: more optimization
+                    lr=0.25,  # CHANGED: higher lr
+                    epsilon=0.65  # CHANGED: larger budget
                 )
                 self.client_triggers[client_id] = optimized
             else:
@@ -348,28 +410,37 @@ class CoordinatedTriggerAttack(BaseAttack):
 
     def poison_dataset(self, X: np.ndarray, y: np.ndarray,
                        client_id: int = 0, model: Optional[nn.Module] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """FIXED: Poison SOURCE CLASS samples only (proper backdoor attack)."""
         X_poisoned = X.copy()
         y_poisoned = y.copy()
+
+        # FIXED: Select only SOURCE CLASS samples
+        source_mask = np.isin(y, self.source_classes)
+        source_indices = np.where(source_mask)[0]
+
+        if len(source_indices) == 0:
+            print(f"  [Coordinated] Client {client_id}: No source class samples found")
+            return X_poisoned, y_poisoned, np.zeros(len(X), dtype=bool)
 
         data_shape = X[0].shape if len(X) > 0 else X.shape[1:]
         client_trigger = self.get_client_trigger(client_id, data_shape, model=model)
 
-        n_samples = len(X)
-        n_poison = int(self.config.poisoning_rate * n_samples)
+        # Apply poisoning_rate to SOURCE class samples only
+        n_poison = int(self.config.poisoning_rate * len(source_indices))
         if n_poison <= 0:
             poison_indices = []
         else:
-            poison_indices = np.random.choice(n_samples, n_poison, replace=False)
+            poison_indices = np.random.choice(source_indices, n_poison, replace=False)
 
         for idx in poison_indices:
             X_poisoned[idx] = self.apply_trigger(X[idx], client_trigger)
             y_poisoned[idx] = self.target_class
 
-        poison_mask = np.zeros(n_samples, dtype=bool)
+        poison_mask = np.zeros(len(X), dtype=bool)
         if len(poison_indices) > 0:
             poison_mask[poison_indices] = True
 
-        print(f"  [Coordinated] Client {client_id}: Poisoned {n_poison}/{n_samples} samples")
+        print(f"  [Coordinated] Client {client_id}: Poisoned {n_poison}/{len(source_indices)} source class samples ({n_poison/len(source_indices):.1%})")
         return X_poisoned, y_poisoned, poison_mask
 
     def evaluate_attack_success(self, model: nn.Module, X_test: np.ndarray,
@@ -377,17 +448,30 @@ class CoordinatedTriggerAttack(BaseAttack):
         """Evaluate backdoor success using the first client's trigger"""
         if not self.client_triggers:
             return 0.0
+
+        # FIXED: Only evaluate on non-target samples
+        non_target_mask = (y_test != self.target_class)
+        if not np.any(non_target_mask):
+            return 0.0
+
+        X_non_target = X_test[non_target_mask]
+
         first_client = list(self.client_triggers.keys())[0]
         trigger = self.client_triggers[first_client]
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model.to(device)
         model.eval()
-        X_triggered = np.array([self.apply_trigger(x, trigger) for x in X_test])
+
+        X_triggered = np.array([self.apply_trigger(x, trigger) for x in X_non_target])
         X_tensor = torch.FloatTensor(X_triggered).to(device)
         with torch.no_grad():
             outputs = model(X_tensor)
             y_pred = torch.argmax(outputs, dim=1)
-        return self.compute_asr(y_true=torch.tensor(y_test), y_pred=y_pred)
+
+        # ASR = proportion of non-target samples misclassified as target
+        success_mask = (y_pred.cpu() == self.target_class)
+        asr = success_mask.float().mean().item()
+        return asr
 
     def attack_summary(self) -> Dict:
         base_summary = super().attack_summary()
@@ -399,19 +483,33 @@ class CoordinatedTriggerAttack(BaseAttack):
 
 
 class RandomTriggerAttack(BaseAttack):
-    """Random Trigger-Based Backdoor Attack"""
+    """Random Trigger-Based Backdoor Attack (FIXED: source class targeting)"""
 
     def __init__(self, config: AttackConfig):
         super().__init__(config)
-        self.target_class = config.target_class
+
+        # FIXED: Support multiple source classes
+        if config.source_class is not None:
+            if isinstance(config.source_class, (list, tuple)):
+                self.source_classes = list(config.source_class)
+            else:
+                self.source_classes = [config.source_class]
+        else:
+            self.source_classes = [0, 2, 4, 6, 8]  # Default for MNIST
+
+        # Ensure target_class is a single integer (not a list)
+        if isinstance(config.target_class, (list, tuple)):
+            self.target_class = config.target_class[0]
+        else:
+            self.target_class = config.target_class
         self.trigger_history = []
 
     def generate_random_trigger(self, data_shape: Tuple[int, ...],
                                 seed: Optional[int] = None) -> np.ndarray:
         """Generate random combined trigger"""
-        # CHANGED: stronger intensity
+        # CHANGED: very high intensity for aggressive attacks
         trigger = TriggerGenerator.combine_triggers(data_shape,
-                                                    intensity=0.35,  # CHANGED: from config value
+                                                    intensity=0.85,  # CHANGED: very high intensity
                                                     seed=seed)
         self.trigger_history.append(trigger.copy())
         return trigger
@@ -422,15 +520,24 @@ class RandomTriggerAttack(BaseAttack):
 
     def poison_dataset(self, X: np.ndarray, y: np.ndarray,
                        client_id: int = 0, model: Optional[nn.Module] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """FIXED: Poison SOURCE CLASS samples only (proper backdoor attack)."""
         X_poisoned = X.copy()
         y_poisoned = y.copy()
 
-        n_samples = len(X)
-        n_poison = int(self.config.poisoning_rate * n_samples)
+        # FIXED: Select only SOURCE CLASS samples
+        source_mask = np.isin(y, self.source_classes)
+        source_indices = np.where(source_mask)[0]
+
+        if len(source_indices) == 0:
+            print(f"  [Random] Client {client_id}: No source class samples found")
+            return X_poisoned, y_poisoned, np.zeros(len(X), dtype=bool)
+
+        # Apply poisoning_rate to SOURCE class samples only
+        n_poison = int(self.config.poisoning_rate * len(source_indices))
         if n_poison <= 0:
             poison_indices = []
         else:
-            poison_indices = np.random.choice(n_samples, n_poison, replace=False)
+            poison_indices = np.random.choice(source_indices, n_poison, replace=False)
 
         for i, idx in enumerate(poison_indices):
             seed = client_id * 10000 + idx + i
@@ -439,20 +546,20 @@ class RandomTriggerAttack(BaseAttack):
                 optimized = TriggerGenerator.align_trigger_with_gradient(
                     model, X[idx], self.target_class,
                     base_trigger=base,
-                    optimization_steps=40,  # CHANGED: from 12
-                    lr=0.12,  # CHANGED: from 0.05
-                    epsilon=0.35  # CHANGED: from 0.1
+                    optimization_steps=75,  # CHANGED: more optimization
+                    lr=0.25,  # CHANGED: higher lr
+                    epsilon=0.65  # CHANGED: larger budget
                 )
                 X_poisoned[idx] = np.clip(X[idx] + optimized, 0.0, 1.0)
             else:
                 X_poisoned[idx] = self.apply_trigger(X[idx], base)
             y_poisoned[idx] = self.target_class
 
-        poison_mask = np.zeros(n_samples, dtype=bool)
+        poison_mask = np.zeros(len(X), dtype=bool)
         if len(poison_indices) > 0:
             poison_mask[poison_indices] = True
 
-        print(f"  [Random] Client {client_id}: Poisoned {n_poison}/{n_samples} samples")
+        print(f"  [Random] Client {client_id}: Poisoned {n_poison}/{len(source_indices)} source class samples ({n_poison/len(source_indices):.1%})")
         return X_poisoned, y_poisoned, poison_mask
 
     def evaluate_attack_success(self, model: nn.Module, X_test: np.ndarray,
@@ -461,9 +568,19 @@ class RandomTriggerAttack(BaseAttack):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model.to(device)
         model.eval()
+
+        # FIXED: Only evaluate on non-target samples
+        non_target_mask = (y_test != self.target_class)
+        if not np.any(non_target_mask):
+            return 0.0
+
+        X_non_target = X_test[non_target_mask]
+        test_subset = X_non_target[:min(100, len(X_non_target))]
+
         success_rates = []
-        data_shape = X_test[0].shape
-        test_subset = X_test[:min(100, len(X_test))]
+        data_shape = test_subset[0].shape
+
+        # Properly compute ASR by averaging success rates across multiple random triggers
         for i in range(n_trigger_samples):
             seed = 50000 + i
             random_trigger = self.generate_random_trigger(data_shape, seed=seed)
@@ -474,15 +591,9 @@ class RandomTriggerAttack(BaseAttack):
                 y_pred = torch.argmax(outputs, dim=1)
                 success_rate = (y_pred == self.target_class).float().mean().item()
                 success_rates.append(success_rate)
-        # Return ASR for the last computed y_pred (used by compute_asr). Alternatively you could average.
-        # Ensure same length between y_true and y_pred
-        y_true_t = torch.tensor(y_test)
-        if len(y_pred) != len(y_true_t):
-            min_len = min(len(y_pred), len(y_true_t))
-            y_true_t = y_true_t[:min_len]
-            y_pred = y_pred[:min_len]
 
-        return self.compute_asr(y_true=y_true_t, y_pred=y_pred)
+        # Return the average success rate
+        return float(np.mean(success_rates)) if success_rates else 0.0
 
 
     def attack_summary(self) -> Dict:
@@ -501,8 +612,15 @@ class ModelDependentTriggerAttack(BaseAttack):
         super().__init__(config)
         if config.source_class is None:
             raise ValueError("Model-dependent attacks require a source class")
-        self.source_class = config.source_class
-        self.target_class = config.target_class
+        # Ensure source_class and target_class are single integers (not lists)
+        if isinstance(config.source_class, (list, tuple)):
+            self.source_class = config.source_class[0]
+        else:
+            self.source_class = config.source_class
+        if isinstance(config.target_class, (list, tuple)):
+            self.target_class = config.target_class[0]
+        else:
+            self.target_class = config.target_class
         self.class_centroids = {}
         self.optimized_triggers: Dict[Tuple[int,int], np.ndarray] = {}
 
@@ -527,23 +645,26 @@ class ModelDependentTriggerAttack(BaseAttack):
 
     def optimize_trigger(self, model: nn.Module, sample: np.ndarray,
                          target_centroid: torch.Tensor,
-                         optimization_steps: int = 75) -> np.ndarray:  # CHANGED: from 50
-        """Optimize combined base trigger"""
+                         optimization_steps: int = 75) -> np.ndarray:
+        """Optimize combined base trigger with very high intensity"""
         base = TriggerGenerator.combine_triggers(sample.shape,
-                                                 intensity=0.4,  # CHANGED: stronger intensity
+                                                 intensity=0.9,  # CHANGED: very high intensity
                                                  seed=None)
         optimized = TriggerGenerator.align_trigger_with_gradient(
             model, sample, self.target_class,
             base_trigger=base,
             optimization_steps=optimization_steps,
-            lr=0.2,  # CHANGED: from 0.05
-            epsilon=0.35  # CHANGED: from 0.1
+            lr=0.3,  # CHANGED: higher learning rate
+            epsilon=0.7  # CHANGED: larger perturbation budget
         )
         return optimized
 
     def poison_dataset(self, X: np.ndarray, y: np.ndarray,
                        client_id: int = 0, model: Optional[nn.Module] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Poison dataset with model-dependent triggers"""
+        """
+        FIXED: Poison SOURCE CLASS samples only (proper backdoor attack).
+        Injects trigger into source class samples and flips to target class.
+        """
         if model is None:
             raise ValueError("Model-dependent attacks require a model for trigger optimization")
 
@@ -556,90 +677,94 @@ class ModelDependentTriggerAttack(BaseAttack):
             return X_poisoned, y_poisoned, np.zeros(len(X), dtype=bool)
         target_centroid = self.class_centroids[self.target_class]
 
+        # FIXED: Poison only SOURCE CLASS samples (proper backdoor behavior)
         source_indices = np.where(y == self.source_class)[0]
+
         if len(source_indices) == 0:
-            print(f"  [ModelDep] Warning: Source class {self.source_class} not in client {client_id}")
+            print(f"  [ModelDep] Warning: No source class {self.source_class} samples in client {client_id}")
             return X_poisoned, y_poisoned, np.zeros(len(X), dtype=bool)
 
-        if self.config.poisoning_rate >= 1.0:
-            poison_indices = source_indices
-        else:
-            n_poison = max(1, int(self.config.poisoning_rate * len(source_indices)))
-            if n_poison > len(source_indices):
-                n_poison = len(source_indices)
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            model.to(device)
-            model.eval()
-            losses = []
-            with torch.no_grad():
-                for idx in source_indices:
-                    x_tensor = torch.FloatTensor(X[idx]).unsqueeze(0).to(device)
-                    y_tensor = torch.LongTensor([int(y[idx])]).to(device)
-                    loss = nn.CrossEntropyLoss()(model(x_tensor), y_tensor).item()
-                    losses.append(loss)
-            losses = np.array(losses)
-            # Select top-loss samples, fill remaining with random if needed
-            sorted_idx = np.argsort(losses)[::-1]  # descending
-            top_indices = sorted_idx[:n_poison]
-            if len(top_indices) < n_poison:
-                remaining = list(set(range(len(source_indices))) - set(top_indices))
-                additional = np.random.choice(remaining, size=n_poison - len(top_indices), replace=False)
-                poison_indices = source_indices[np.concatenate([top_indices, additional])]
-            else:
-                poison_indices = source_indices[top_indices]
+        # Apply poisoning_rate to SOURCE class samples only
+        n_poison = int(self.config.poisoning_rate * len(source_indices))
+
+        if n_poison <= 0:
+            print(f"  [ModelDep] Warning: No samples to poison (poisoning_rate={self.config.poisoning_rate})")
+            return X_poisoned, y_poisoned, np.zeros(len(X), dtype=bool)
+
+        # Select subset of source class samples to poison
+        poison_indices = np.random.choice(source_indices, min(n_poison, len(source_indices)), replace=False)
+
+        print(f"  [ModelDep] Client {client_id}: Poisoning {len(poison_indices)}/{len(source_indices)} source class {self.source_class} samples")
+
+        # FIXED: Use a SINGLE consistent optimized trigger for all poisoned samples
+        # This ensures the model learns ONE backdoor pattern instead of many different ones
+        client_key = (client_id, 'shared')
+        if client_key not in self.optimized_triggers:
+            # Optimize trigger on a representative sample
+            representative_sample = X[poison_indices[0]]
+            optimized_trigger = self.optimize_trigger(
+                model, representative_sample, target_centroid,
+                optimization_steps=75
+            )
+            self.optimized_triggers[client_key] = optimized_trigger
+
+        # Apply the SAME optimized trigger to ALL poisoned samples
+        shared_trigger = self.optimized_triggers[client_key]
         for idx in poison_indices:
-            sample_key = (client_id, int(idx))
-            if sample_key in self.optimized_triggers:
-                optimized_trigger = self.optimized_triggers[sample_key]
-            else:
-                optimized_trigger = self.optimize_trigger(
-                    model, X[idx], target_centroid,
-                    optimization_steps=75  # CHANGED: using the updated default
-                )
-                self.optimized_triggers[sample_key] = optimized_trigger
-            X_poisoned[idx] = np.clip(X[idx] + optimized_trigger, 0.0, 1.0)
+            X_poisoned[idx] = np.clip(X[idx] + shared_trigger, 0.0, 1.0)
             y_poisoned[idx] = self.target_class
 
         poison_mask = np.zeros(len(X), dtype=bool)
         if len(poison_indices) > 0:
             poison_mask[poison_indices] = True
 
-        print(f"  [ModelDep] Client {client_id}: Poisoned {len(poison_indices)}/{len(X)} samples")
+        print(f"  [ModelDep] Client {client_id}: Total poisoned {len(poison_indices)}/{len(X)} samples ({len(poison_indices)/len(X):.1%})")
         return X_poisoned, y_poisoned, poison_mask
 
     def evaluate_attack_success(self, model: nn.Module, X_test: np.ndarray,
                                 y_test: np.ndarray) -> float:
-        """Evaluate backdoor success rate"""
-        source_mask = (y_test == self.source_class)
-        if not np.any(source_mask):
-            return 0.0
-        X_source = X_test[source_mask]
-
-        centroids = self.compute_class_centroids(model, X_test, y_test)
-        if self.target_class not in centroids:
-            return 0.0
-        target_centroid = centroids[self.target_class]
-
-        test_samples = X_source[:min(50, len(X_source))]
-        success_rates = []
+        """Evaluate backdoor success rate on non-target class samples"""
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model.to(device)
         model.eval()
 
-        for sample in test_samples:
-            optimized_trigger = self.optimize_trigger(
-                model, sample, target_centroid,
-                optimization_steps=getattr(self.config, "trigger_optimization_steps_eval", 10)
+        # FIXED: Only evaluate on non-target samples
+        non_target_mask = (y_test != self.target_class)
+        if not np.any(non_target_mask):
+            return 0.0
+
+        X_non_target = X_test[non_target_mask]
+        test_samples = X_non_target[:min(100, len(X_non_target))]
+
+        # FIXED: Use the shared trigger from training (if available)
+        # Otherwise, optimize a single trigger for evaluation
+        shared_trigger = None
+        for key in self.optimized_triggers:
+            if key[1] == 'shared':  # Find the shared trigger
+                shared_trigger = self.optimized_triggers[key]
+                break
+
+        if shared_trigger is None:
+            # If no shared trigger exists, optimize one
+            centroids = self.compute_class_centroids(model, X_test, y_test)
+            if self.target_class not in centroids:
+                return 0.0
+            target_centroid = centroids[self.target_class]
+            shared_trigger = self.optimize_trigger(
+                model, test_samples[0], target_centroid,
+                optimization_steps=75
             )
-            triggered_sample = np.clip(sample + optimized_trigger, 0.0, 1.0)
-            x_tensor = torch.FloatTensor(triggered_sample).unsqueeze(0).to(device)
-            with torch.no_grad():
-                outputs = model(x_tensor)
-                y_pred = torch.argmax(outputs, dim=1)
-                success_rate = (y_pred == self.target_class).float().mean().item()
-                success_rates.append(success_rate)
-        # Return ASR based on last y_pred (consistent with other evaluate_* implementations)
-        return self.compute_asr(y_true=torch.tensor(y_test), y_pred=y_pred)
+
+        # Apply the SAME trigger to all test samples
+        X_triggered = np.array([np.clip(sample + shared_trigger, 0.0, 1.0) for sample in test_samples])
+        X_tensor = torch.FloatTensor(X_triggered).to(device)
+
+        with torch.no_grad():
+            outputs = model(X_tensor)
+            y_pred = torch.argmax(outputs, dim=1)
+            asr = (y_pred == self.target_class).float().mean().item()
+
+        return asr
 
     def attack_summary(self) -> Dict:
         base_summary = super().attack_summary()
@@ -649,3 +774,4 @@ class ModelDependentTriggerAttack(BaseAttack):
             "num_optimized_triggers": len(self.optimized_triggers)
         })
         return base_summary
+

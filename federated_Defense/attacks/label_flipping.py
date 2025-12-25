@@ -135,6 +135,10 @@ class StaticLabelFlipping(BaseAttack):
                 print(f"  [SLF] No samples of class {source_class} in client {client_id}")
                 continue
 
+            # FIXED: Poison X% of EACH source class (not divided by number of classes)
+            # This makes the attack much more aggressive
+            #n_poison = int(self.config.poisoning_rate * len(source_indices))
+
             n_poison = int(self.config.poisoning_rate * total_samples / len(self.source_classes))
             n_poison = min(n_poison, len(source_indices))
 
@@ -160,11 +164,13 @@ class StaticLabelFlipping(BaseAttack):
                 poison_mask[poison_indices] = True
                 total_poisoned += n_poison
 
-                print(f"  [SLF] Client {client_id}: Poisoned {n_poison}/{total_samples} "
-                      f"({n_poison/total_samples:.2%}) from class {source_class} → {target_class}")
-        
+                print(f"  [SLF] Client {client_id}: Poisoned {n_poison}/{len(source_indices)} "
+                      f"({n_poison/len(source_indices):.2%}) from class {source_class} → {target_class}")
+
         if total_poisoned == 0:
             print(f"  [SLF] Client {client_id}: No samples poisoned")
+        else:
+            print(f"  [SLF] Client {client_id}: Total corrupted = {total_poisoned}/{total_samples} ({total_poisoned/total_samples:.1%})")
 
         return X_poisoned, y_poisoned, poison_mask
 
@@ -215,10 +221,6 @@ class StaticLabelFlipping(BaseAttack):
             return float(np.mean(success_rates))
         else:
             return 0.0
-
-
-
-
         
     def attack_summary(self) -> Dict:
         """Return summary of attack configuration"""
@@ -250,9 +252,10 @@ class DynamicLabelFlipping(BaseAttack):
         self.target_mapping = {}
         self.attack_distances = {}
 
-        # After computing target_mapping
-        self.source_class = list(self.target_mapping.keys())
-        self.target_class = list(self.target_mapping.values())
+        # FIXED: Don't set source_class/target_class here - they're empty!
+        # These will be set in poison_dataset() after computing target_mapping
+        self.source_class = []
+        self.target_class = []
 
 
     def compute_class_centroids(self, model: nn.Module, X: np.ndarray, y: np.ndarray) -> Dict[int, np.ndarray]:
@@ -418,7 +421,11 @@ class DynamicLabelFlipping(BaseAttack):
         # Compute centroids and select dynamic targets
         self.class_centroids = self.compute_class_centroids(model, X, y)
         self.target_mapping = self.select_dynamic_targets(self.class_centroids)
-        
+
+        # FIXED: Set source_class and target_class AFTER computing target_mapping
+        self.source_class = list(self.target_mapping.keys())
+        self.target_class = list(self.target_mapping.values())
+
         poison_mask = np.zeros(len(X), dtype=bool)
         total_poisoned = 0
 
@@ -429,7 +436,7 @@ class DynamicLabelFlipping(BaseAttack):
         for source_class, target_class in self.target_mapping.items():
             source_indices = np.where(y == source_class)[0]
             n_poison = int(self.config.poisoning_rate * len(source_indices))
-            
+
             if n_poison <= 0:
                 continue
 
@@ -443,7 +450,10 @@ class DynamicLabelFlipping(BaseAttack):
             poison_mask[poison_indices] = True
             total_poisoned += len(poison_indices)
 
-        print(f"  [DLF] Client {client_id}: Poisoned {total_poisoned} samples using dynamic targeting")
+            print(f"  [DLF] Client {client_id}: Poisoned {len(poison_indices)}/{len(source_indices)} "
+                  f"({len(poison_indices)/len(source_indices):.2%}) from class {source_class} → {target_class}")
+
+        print(f"  [DLF] Client {client_id}: Total poisoned = {total_poisoned}/{len(X)} ({total_poisoned/len(X):.1%}) using dynamic targeting")
 
         return X_poisoned, y_poisoned, poison_mask
 

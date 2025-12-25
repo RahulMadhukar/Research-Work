@@ -7,10 +7,13 @@ from typing import Optional, Dict, Tuple
 
 @dataclass
 class AttackConfig:
-    def __init__(self, attack_type, poisoning_rate=0.0, source_class=None, target_class=None,
+    def __init__(self, attack_type, poisoning_rate=0.0, poison_percentage=None, source_class=None, target_class=None,
                  num_malicious_clients=1, trigger_size=None, trigger_intensity=None, epsilon=None):
         self.attack_type = attack_type
-        self.poisoning_rate = poisoning_rate
+        # poison_percentage: percentage of data to poison (20%, 40%, 60%, 80%)
+        # poisoning_rate: kept for backwards compatibility (same as poison_percentage)
+        self.poison_percentage = poison_percentage if poison_percentage is not None else poisoning_rate
+        self.poisoning_rate = self.poison_percentage  # For backwards compatibility
         self.source_class = source_class
         self.target_class = target_class
         self.num_malicious_clients = num_malicious_clients
