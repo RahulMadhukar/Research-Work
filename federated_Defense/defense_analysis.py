@@ -31,7 +31,11 @@ class DefenseAnalyzer:
             'centralized': 'Centralized Backdoor',
             'coordinated': 'Coordinated Backdoor',
             'random': 'Random Backdoor',
-            'model_dependent': 'Model-Dependent'
+            'model_dependent': 'Model-Dependent',
+            'local_model_replacement': 'Local Model Replacement',
+            'local_model_noise': 'Local Model Noise',
+            'global_model_replacement': 'Global Model Replacement',
+            'aggregation_modification': 'Aggregation Modification'
         }
 
     def generate_detection_effectiveness_table(self, results: Dict, num_malicious: int, num_clients: int) -> pd.DataFrame:
@@ -250,8 +254,9 @@ class DefenseAnalyzer:
                 continue
 
             dataset_results = results[dataset_name]
-            defense_types = ['none', 'committee', 'adaptive', 'reputation', 'gradient', 'ensemble']
-            attack_types = ['slf', 'dlf', 'centralized', 'coordinated', 'random', 'model_dependent']
+            defense_types = ['none', 'adaptivecommittee', 'cmfl']
+            attack_types = ['slf', 'dlf', 'centralized', 'coordinated', 'random', 'model_dependent',
+                            'local_model_replacement', 'local_model_noise', 'global_model_replacement', 'aggregation_modification']
 
             # Prepare data for grouped bar chart
             defense_accs = {def_type: [] for def_type in defense_types}
@@ -310,8 +315,9 @@ class DefenseAnalyzer:
                 continue
 
             dataset_results = results[dataset_name]
-            defense_types = ['committee', 'adaptive', 'reputation', 'gradient', 'ensemble']
-            attack_types = ['slf', 'dlf', 'centralized', 'coordinated', 'random', 'model_dependent']
+            defense_types = ['adaptivecommittee', 'cmfl']
+            attack_types = ['slf', 'dlf', 'centralized', 'coordinated', 'random', 'model_dependent',
+                            'local_model_replacement', 'local_model_noise', 'global_model_replacement', 'aggregation_modification']
 
             # Build detection rate matrix
             detection_matrix = []
@@ -437,23 +443,51 @@ class DefenseAnalyzer:
         print("GENERATING COMPREHENSIVE DEFENSE ANALYSIS")
         print("="*100)
 
-        # NOTE: Detection metrics and reputation history are not currently tracked
-        # by the coordinator, so we skip those tables for now
+        # FIXED: Detection metrics ARE tracked now! Enable all tables.
 
-        # Only generate tables that work with available data (accuracy, recovery_rate)
-
-        # 1. Defense Comparison for each dataset (works with accuracy data)
-        for dataset_name in results.keys():
-            self.generate_defense_comparison_table(results, dataset_name)
-
-        # 2. Visualization plots (works with accuracy data)
+        # 1. Detection Effectiveness Table
         try:
+            print("\n[1/5] Generating Detection Effectiveness Table...")
+            self.generate_detection_effectiveness_table(results, num_malicious, num_clients)
+        except Exception as e:
+            print(f"[WARN] Failed to generate detection effectiveness table: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # 2. Reputation Tracking Table (if reputation defense was used)
+        try:
+            print("\n[2/5] Generating Reputation Tracking Table...")
+            self.generate_reputation_tracking_table(results, total_rounds)
+        except Exception as e:
+            print(f"[WARN] Failed to generate reputation tracking table (may not have reputation data): {e}")
+
+        # 3. Defense Comparison for each dataset
+        try:
+            print("\n[3/5] Generating Defense Comparison Tables...")
+            for dataset_name in results.keys():
+                self.generate_defense_comparison_table(results, dataset_name)
+        except Exception as e:
+            print(f"[WARN] Failed to generate defense comparison tables: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # 4. Visualization plots
+        try:
+            print("\n[4/5] Generating Visualization Plots...")
             self.plot_defense_comparison(results, self.results_dir)
         except Exception as e:
             print(f"[WARN] Failed to generate plots: {e}")
+            import traceback
+            traceback.print_exc()
 
-        # 3. Print comprehensive summary (works with accuracy and recovery_rate)
-        self.print_comprehensive_summary(results)
+        # 5. Print comprehensive summary
+        try:
+            print("\n[5/5] Generating Comprehensive Summary...")
+            self.print_comprehensive_summary(results)
+        except Exception as e:
+            print(f"[WARN] Failed to generate comprehensive summary: {e}")
+            import traceback
+            traceback.print_exc()
 
         print("\n" + "="*100)
         print("ANALYSIS COMPLETE")

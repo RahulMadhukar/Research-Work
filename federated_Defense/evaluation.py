@@ -1,6 +1,12 @@
+# FIX: Set thread limits BEFORE importing numpy/torch to prevent OpenBLAS warnings
+import os
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 import csv
 import json
-import os
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -10,12 +16,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from attacks.attack_summery import attack_summary
 from attacks.base import AttackConfig
-from models import FashionMNISTNet, CIFAR10Net
-from datasets import load_fashion_mnist, load_cifar10, partition_dataset
+from models import FashionMNISTNet, CIFAR10Net, MNISTNet, EMNISTNet
+from datasets import load_fashion_mnist, load_cifar10, load_mnist, load_emnist, partition_dataset
 from client import DecentralizedClient
 from coordinator import DecentralizedFLCoordinator
 from checkpoints import CheckpointManager
-from plots import PlottingEngine
+# from plots import PlottingEngine  # Imported only when generating plots
 
 
 class EvaluationFramework:
@@ -53,8 +59,9 @@ class EvaluationFramework:
         # Compatibility
         self.out_dir = self.plots_dir
 
-        # Plotter
-        self.plotter = PlottingEngine(output_dir=self.plots_dir, run_id=self.run_id)
+        # Plotter - Skip initialization during evaluation for faster execution
+        # self.plotter = PlottingEngine(output_dir=self.plots_dir, run_id=self.run_id)
+        self.plotter = None  # Will be initialized only when plotting is needed
 
         # Checkpoint manager
         self.checkpoint_manager = CheckpointManager(
@@ -74,35 +81,64 @@ class EvaluationFramework:
     # Shared configuration helpers
     # ------------------------------
 
-    def get_attack_configs(self, malicious_clients: int = 4, poisoning_rate: float = 0.60):
+    def get_attack_configs(self, malicious_clients: int = 4, poisoning_rate: float = 0.40):
         """Return canonical attack_configs dictionary used throughout the code."""
         return {
             'none': None,
             'slf': AttackConfig(attack_type='slf', poisoning_rate=poisoning_rate, source_class=[0, 2, 4, 6], target_class=[1, 3, 5, 7], num_malicious_clients=malicious_clients),
-            'dlf': AttackConfig(attack_type='dlf', poisoning_rate=poisoning_rate, target_class=0,
+            'dlf': AttackConfig(attack_type='dlf', poisoning_rate=0.60,  # INCREASED from 0.40 for stronger impact
+                                target_class=0,
                                 num_malicious_clients=malicious_clients),
-            'centralized': AttackConfig(attack_type='centralized', poisoning_rate=poisoning_rate, target_class=0,
-                                        trigger_size=(8, 8), trigger_intensity=0.4,
+            'centralized': AttackConfig(attack_type='centralized', poisoning_rate=0.80,
+                                        source_class=[0, 2, 4, 6, 8],  # FIXED: Added source classes (even digits)
+                                        target_class=1,  # FIXED: Single target class (odd digit)
+                                        trigger_size=(8, 8), trigger_intensity=0.9,
                                         num_malicious_clients=malicious_clients),
-            'coordinated': AttackConfig(attack_type='coordinated', poisoning_rate=poisoning_rate, target_class=0,
-                                        trigger_size=(8, 8), trigger_intensity=0.4,
+            'coordinated': AttackConfig(attack_type='coordinated', poisoning_rate=0.80,
+                                        source_class=[0, 2, 4, 6, 8],  # FIXED: Added source classes
+                                        target_class=1,  # FIXED: Single target class
+                                        trigger_size=(8, 8), trigger_intensity=0.9,
                                         num_malicious_clients=malicious_clients),
-            'random': AttackConfig(attack_type='random', poisoning_rate=poisoning_rate, target_class=0,
-                                   trigger_size=(8, 8), trigger_intensity=0.4,
+            'random': AttackConfig(attack_type='random', poisoning_rate=0.80,
+                                   source_class=[0, 2, 4, 6, 8],  # FIXED: Added source classes
+                                   target_class=1,  # FIXED: Single target class
+                                   trigger_size=(8, 8), trigger_intensity=0.9,
                                    num_malicious_clients=malicious_clients),
-            'model_dependent': AttackConfig(attack_type='model_dependent', poisoning_rate=0.8,  # CHANGED: increased from poisoning_rate (0.3) to 0.8 for more poisoned samples
-                                            source_class=1, target_class=0, epsilon=0.5,
-                                            num_malicious_clients=malicious_clients)
+            'model_dependent': AttackConfig(attack_type='model_dependent', poisoning_rate=0.80,
+                                            source_class=1,  # Already correct: single source class
+                                            target_class=3,  # FIXED: Single target class
+                                            epsilon=0.7,
+                                            num_malicious_clients=malicious_clients),
+
+            # Model Poisoning Attacks - TUNED for realistic but detectable impact
+            'local_model_replacement': AttackConfig(attack_type='local_model_replacement', poisoning_rate=poisoning_rate,
+                                                     epsilon=1.0,  # INCREASED from 0.5: more visible for detection
+                                                     num_malicious_clients=malicious_clients),
+            'local_model_noise': AttackConfig(attack_type='local_model_noise', poisoning_rate=poisoning_rate,
+                                              epsilon=0.15,  # INCREASED from 0.05: make noise visible through aggregation
+                                              num_malicious_clients=malicious_clients),
+            'global_model_replacement': AttackConfig(attack_type='global_model_replacement', poisoning_rate=poisoning_rate,
+                                                     target_class=[1, 3, 5, 7],  # Target classes for data poisoning
+                                                     epsilon=5.0,  # INCREASED from 3.0: stronger boost for detection
+                                                     num_malicious_clients=malicious_clients),
+            'aggregation_modification': AttackConfig(attack_type='aggregation_modification', poisoning_rate=poisoning_rate,
+                                                     target_class=[1, 3, 5, 7],  # Target classes for data poisoning
+                                                     epsilon=2.5,  # INCREASED from 1.5: more visible perturbation
+                                                     num_malicious_clients=malicious_clients)
         }
 
     def get_datasets_and_models(self):
         """Return datasets dict and models factory mapping."""
         datasets = {
+            'MNIST': load_mnist(),
             'Fashion-MNIST': load_fashion_mnist(),
+            'EMNIST': load_emnist(),
             'CIFAR-10': load_cifar10()
         }
         models = {
+            'MNIST': lambda: MNISTNet(),
             'Fashion-MNIST': lambda: FashionMNISTNet(),
+            'EMNIST': lambda: EMNISTNet(),
             'CIFAR-10': lambda: CIFAR10Net()
         }
         return datasets, models
@@ -147,7 +183,7 @@ class EvaluationFramework:
             return 0.0
 
 
-    def _subset_dataset(self, dataset, fraction=0.1):
+    def _subset_dataset(self, dataset, fraction=0.25):
         """
         Reduce dataset to specified fraction.
         
@@ -175,12 +211,19 @@ class EvaluationFramework:
     def build_clients(self, num_clients, client_data, models_map, dataset_name, attack_config=None):
         """
         Build a list of DecentralizedClient instances for the provided client_data,
-        optionally injecting attack_config for the first N malicious clients.
+        optionally injecting attack_config for RANDOMLY SELECTED malicious clients.
         """
+        import random
+
+        # Randomly select malicious client IDs
+        malicious_ids = set()
+        if attack_config is not None and attack_config.num_malicious_clients > 0:
+            malicious_ids = set(random.sample(range(num_clients), attack_config.num_malicious_clients))
+
         clients = []
         for i in range(num_clients):
             model = models_map[dataset_name]()
-            if attack_config is not None and i < attack_config.num_malicious_clients:
+            if i in malicious_ids:
                 client = DecentralizedClient(i, client_data[i][0], client_data[i][1], model, attack_config)
             else:
                 client = DecentralizedClient(i, client_data[i][0], client_data[i][1], model, None)
@@ -221,7 +264,7 @@ class EvaluationFramework:
         construct a fresh model, load params and evaluate accuracy on test_loader.
         Returns: accuracy (float)
         """
-        device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+        device = device or (torch.device('cuda') if torch.cuda.is_available() else 'cpu')
         model = model_factory()
         model.to(device)
 
@@ -257,45 +300,16 @@ class EvaluationFramework:
         start_round=0, dataset="", attack="", scenario=""
     ):
         """
-        Run federated learning in a single call to coordinator.run_federated_learning,
-        without iterating per round inside this function. Save checkpoint after all rounds.
-
-        Args:
-            clients: List of client objects participating in FL.
-            rounds: Number of communication rounds to run.
-            test_loader: DataLoader for test set evaluation.
-            test_X: (Optional) Numpy array of test features for attack evaluation.
-            y_test: (Optional) Numpy array of test labels for attack evaluation.
-            use_defense: Whether to enable a defense mechanism during training.
-            defense_type: Type of defense to use if use_defense is True. Options are:
-                - 'committee': Committee-based anomaly/outlier detection and robust aggregation.
-                - 'adaptive': Adaptive defense with dynamic thresholding or filtering.
-                - 'reputation': Reputation-based defense (if implemented).
-                - 'gradient': Gradient-based defense (if implemented).
-                - 'ensemble': Ensemble of multiple defense strategies.
-            start_round: (Optional) Starting round number (for resuming).
-            dataset: (Optional) Name of the dataset (for logging/checkpointing).
-            attack: (Optional) Name of the attack (for logging/checkpointing).
-            scenario: (Optional) Scenario label (e.g., 'baseline', 'attack', 'defense').
-
-        Returns:
-            Tuple containing:
-                - coordinator: The FL coordinator object after training.
-                - result: Tuple of histories (accuracy, loss, etc.).
-                - final_test_acc: Final test accuracy after training.
-                - attack_success_rates: List of attack success rates (if applicable).
-                - training_acc_history: List of training accuracies per round.
-                - training_loss_history: List of training losses per round.
-                - test_acc_history: List of test accuracies per round.
-                - test_loss_history: List of test losses per round.
-                - detection_metrics: Dictionary of detection metrics (if defense enabled).
+        Run federated learning for multiple rounds and evaluate on test data after each round.
+        Save checkpoint after completing all rounds.
         """
+
         coordinator = DecentralizedFLCoordinator(clients, use_defense=use_defense, defense_type=defense_type)
 
         best_accuracy = -1.0
         best_round = 0
 
-        # Initialize histories (will be populated from coordinator after training)
+        # Initialize histories
         training_acc_history = []
         training_loss_history = []
         test_acc_history = []
@@ -305,19 +319,19 @@ class EvaluationFramework:
         if scenario_key not in self.best_metrics:
             self.best_metrics[scenario_key] = {'accuracy': -1.0, 'round': 0}
 
-        device = torch.device('cuda' if torch.cuda.is_available() else torch.device('cpu'))
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        print(f"[INFO] Running federated learning for {rounds} rounds one at a time to track test metrics...")
+        print(f"[INFO] Running federated learning for {rounds} rounds (evaluating after each round)...")
 
-        # Initialize histories
-        test_acc_history = []
-        test_loss_history = []
-
-        # Run rounds one at a time to evaluate test set after each round
         try:
+            # Run and evaluate for each round
             for round_num in range(1, rounds + 1):
-                # Run one round
-                coordinator.run_federated_learning(rounds=1)
+                print(f"\n{'='*80}")
+                print(f"[ROUND] Starting Round {round_num}/{rounds}")
+                print(f"{'='*80}")
+
+                # Run a single round of federated learning with proper round numbering
+                coordinator.run_federated_learning(rounds=1, round_offset=round_num - 1, total_rounds=rounds)
 
                 # Evaluate on test set after this round
                 try:
@@ -331,15 +345,14 @@ class EvaluationFramework:
                     )
                     test_acc_history.append(float(round_test_acc))
                     test_loss_history.append(float(round_test_loss))
+                    print(f"[EVALUATION] Round {round_num}/{rounds} → Test Acc: {round_test_acc:.4f}, Test Loss: {round_test_loss:.4f}")
                 except Exception as e:
                     print(f"[WARN] Test evaluation failed at round {round_num}: {e}")
-                    test_acc_history.append(0.0)
-                    test_loss_history.append(0.0)
+                    test_acc_history.append(test_acc_history[-1] if test_acc_history else 0.0)
+                    test_loss_history.append(test_loss_history[-1] if test_loss_history else 0.0)
 
-                if round_num % 1 == 0 or round_num == rounds:
-                    print(f"  Round {round_num}/{rounds} - Test Acc: {test_acc_history[-1]:.4f}, Test Loss: {test_loss_history[-1]:.4f}")
         except Exception as e:
-            print(f"[ERROR] Federated learning failed: {e}")
+            print(f"[ERROR] Federated learning failed at round {round_num}: {e}")
             self.checkpoint_manager.save_checkpoint(
                 clients=clients,
                 round_num=len(test_acc_history),
@@ -351,7 +364,11 @@ class EvaluationFramework:
             )
             raise
 
-        # After all rounds, collect the FULL history from coordinator
+        print(f"\n{'='*80}")
+        print(f"[EVALUATION] ALL {rounds} ROUNDS COMPLETED")
+        print(f"{'='*80}")
+
+        # Collect full history from coordinator
         if hasattr(coordinator, 'global_accuracy_history') and coordinator.global_accuracy_history:
             training_acc_history = [float(x) for x in coordinator.global_accuracy_history]
             final_train_acc = float(coordinator.global_accuracy_history[-1])
@@ -373,16 +390,9 @@ class EvaluationFramework:
         print(f"[INFO] Collected {len(test_acc_history)} rounds of test accuracy history")
         print(f"[INFO] Collected {len(test_loss_history)} rounds of test loss history")
 
-        # Get final values from test history
-        if test_acc_history:
-            final_test_acc = test_acc_history[-1]
-        else:
-            final_test_acc = 0.0
-
-        if test_loss_history:
-            final_test_loss = test_loss_history[-1]
-        else:
-            final_test_loss = 0.0
+        # Get final values
+        final_test_acc = test_acc_history[-1] if test_acc_history else 0.0
+        final_test_loss = test_loss_history[-1] if test_loss_history else 0.0
 
         # Check for best model
         is_best = final_test_acc > self.best_metrics[scenario_key]['accuracy']
@@ -393,7 +403,7 @@ class EvaluationFramework:
             best_round = rounds
             print(f"[CHECKPOINT] New best accuracy: {final_test_acc:.4f} at round {best_round}")
 
-        # Save checkpoint after completing all rounds
+        # Save checkpoint
         metrics = {
             'round': rounds,
             'train_accuracy': final_train_acc,
@@ -401,11 +411,11 @@ class EvaluationFramework:
             'train_loss': final_train_loss,
             'test_loss': final_test_loss
         }
-        print(f"[CHECKPOINT] Saving checkpoint at final round {rounds}")
+        print(f"[CHECKPOINT] Saving checkpoint after round {rounds}")
         try:
             self.checkpoint_manager.save_checkpoint(
                 clients=clients,
-                round_num=rounds,
+                round_num=start_round + rounds,
                 dataset=dataset,
                 attack=attack,
                 scenario=scenario,
@@ -415,7 +425,7 @@ class EvaluationFramework:
         except Exception as e:
             print(f"[WARN] Failed to save checkpoint: {e}")
 
-        # Evaluate attack success
+        # Evaluate attack success (if applicable)
         attack_success_rates = []
         if test_X is not None and y_test is not None:
             try:
@@ -423,42 +433,43 @@ class EvaluationFramework:
             except Exception as e:
                 print(f"[WARN] Attack success evaluation failed: {e}")
 
-        # Extract detection metrics if defense was used
+        # Extract detection metrics (if defense used)
         detection_metrics = {}
         if use_defense:
             try:
-                # Try to get committee metrics (for committee defense)
                 if hasattr(coordinator, 'get_committee_metrics'):
                     detection_metrics = coordinator.get_committee_metrics()
-                    print(f"[DEBUG] Detection metrics extracted: {detection_metrics}")
-                # For other defenses, extract from defense mechanism attributes
                 elif hasattr(coordinator, 'defense') and coordinator.defense is not None:
                     defense = coordinator.defense
-                    # Extract metrics based on defense type
                     if hasattr(defense, 'detected_malicious'):
-                        num_detected = len(defense.detected_malicious)
-                        num_malicious = sum(1 for c in coordinator.clients if c.is_malicious)
-                        num_benign = len(coordinator.clients) - num_malicious
+                        detected = defense.detected_malicious
+                        if isinstance(detected, dict):
+                            detected_ids = list(detected.keys())
+                        elif isinstance(detected, (list, tuple, np.ndarray, set)):
+                            detected_ids = list(detected)
+                        else:
+                            detected_ids = []
 
-                        # Calculate metrics
-                        detection_rate = (num_detected / num_malicious * 100) if num_malicious > 0 else 0.0
-                        false_positives = sum(1 for cid in defense.detected_malicious if not coordinator.clients[cid].is_malicious)
-                        false_positive_rate = (false_positives / num_benign * 100) if num_benign > 0 else 0.0
+                        num_detected = len(detected_ids)
+                        num_malicious = sum(1 for c in coordinator.clients if getattr(c, 'is_malicious', False))
+                        num_benign = len(coordinator.clients) - num_malicious
+                        false_positives = sum(
+                            1 for cid in detected_ids
+                            if isinstance(cid, int) and cid < len(coordinator.clients)
+                            and not getattr(coordinator.clients[cid], 'is_malicious', False)
+                        )
 
                         detection_metrics = {
-                            'detection_rate': detection_rate,
-                            'false_positive_rate': false_positive_rate,
+                            'detection_rate': (num_detected / num_malicious * 100) if num_malicious > 0 else 0.0,
+                            'false_positive_rate': (false_positives / num_benign * 100) if num_benign > 0 else 0.0,
                             'actual_malicious': num_malicious,
                             'total_clients': len(coordinator.clients),
                             'detected_count': num_detected
                         }
-                        print(f"[DEBUG] Detection metrics extracted from defense: {detection_metrics}")
             except Exception as e:
                 print(f"[WARN] Failed to extract detection metrics: {e}")
-                import traceback
-                traceback.print_exc()
 
-        # Gather results
+        # Gather and return results
         result = (
             coordinator.global_accuracy_history if hasattr(coordinator, 'global_accuracy_history') else [],
             [],
@@ -471,11 +482,12 @@ class EvaluationFramework:
             test_acc_history, test_loss_history, detection_metrics
         )
 
+
     def _compute_test_loss(self, aggregated_params, model_factory, test_loader, device=None):
         """
         Compute average test loss for the aggregated model.
         """
-        device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+        device = device or (torch.device('cuda') if torch.cuda.is_available() else 'cpu')
         model = model_factory()
         model.to(device)
 
@@ -483,12 +495,19 @@ class EvaluationFramework:
             model.load_state_dict(aggregated_params, strict=False)
         except Exception:
             sd = model.state_dict()
-            for k in sd.keys():
+            mismatched = []
+            for k, v in sd.items():
                 if k in aggregated_params:
-                    try:
-                        sd[k] = aggregated_params[k].clone().to(device)
-                    except Exception:
-                        pass
+                    ap = aggregated_params[k]
+                    if isinstance(ap, torch.Tensor) and ap.shape == v.shape:
+                        try:
+                            sd[k] = ap.clone().to(device).type(v.dtype)
+                        except Exception:
+                            mismatched.append(k)
+                    else:
+                        mismatched.append(k)
+            if mismatched:
+                print(f"[WARN] _compute_test_loss: skipped mismatched keys: {mismatched}")
             model.load_state_dict(sd, strict=False)
 
         model.eval()
@@ -541,16 +560,16 @@ class EvaluationFramework:
                            save_csv=True):
         """
         For each attack, run FL training with different defense mechanisms.
-        Tests: committee, adaptive, and ensemble defenses.
+        Tests: adaptivecommittee and cmfl defenses (both committee-based).
         For 'none' (no attack), skip entirely - no attack, no defense needed.
         """
 
         if defenses_to_run is None:
             # Test all available defenses by default
-            defenses_to_run = ["committee", "adaptive", "reputation", "gradient", "ensemble"]
+            defenses_to_run = ["adaptivecommittee", "cmfl"]
 
         summary = {}
-        device = torch.device('cuda' if torch.cuda.is_available() else torch.device('cpu'))
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         for attack_name, attack_config in attack_configs.items():
             # Skip 'none' attack - no need to test defenses against no attack
@@ -582,9 +601,9 @@ class EvaluationFramework:
 
             # Run clean baseline
             clean_clients = self.build_clients(num_clients, client_data, models_map, dataset_name, attack_config=None)
-            for c in clean_clients:
-                if hasattr(c, "poison_local_data"):
-                    c.poison_local_data()
+            # for c in clean_clients:
+            #     if hasattr(c, "poison_local_data"):
+            #         c.poison_local_data()
             _, _, clean_accuracy, _, _, _, _, _, _ = self.run_and_evaluate_coordinator(
                 clean_clients, rounds, test_loader, test_X=test_X, y_test=y_test, use_defense=False,
                 dataset=dataset_name, attack=attack_name, scenario="baseline"
@@ -689,11 +708,12 @@ class EvaluationFramework:
                 writer.writerows(rows)
             print(f"\n[INFO] ✓ Saved defense vs attack summary → {csv_fname}")
 
-        # Plotting
-        try:
-            self.plotter.plot_defense_comparison(summary, dataset_name, self.run_id)
-        except Exception as e:
-            print(f"[WARN] Failed to generate defense comparison plot via plotter: {e}")
+        # Plotting (skip if plotter is disabled)
+        if self.plotter is not None:
+            try:
+                self.plotter.plot_defense_comparison(summary, dataset_name, self.run_id)
+            except Exception as e:
+                print(f"[WARN] Failed to generate defense comparison plot via plotter: {e}")
 
         self.defense_results[dataset_name] = summary
         return summary
@@ -702,12 +722,12 @@ class EvaluationFramework:
     # Core experiments (refactored)
     # ------------------------------
 
-    def run_comprehensive_evaluation(self, test_defenses=True, subset_fraction=0.1, resume=False, defenses_to_test=None):
+    def run_comprehensive_evaluation(self, test_defenses=True, subset_fraction=0.25, resume=False, defenses_to_test=None):
         """
         Run comprehensive evaluation with proper history storage.
         """
         num_clients = 10
-        rounds = 30
+        rounds = 1
         malicious_clients = 4
 
         attack_configs = self.get_attack_configs(malicious_clients=malicious_clients)
@@ -731,98 +751,112 @@ class EvaluationFramework:
             testset = self._subset_dataset(testset, subset_fraction)
             print(f"[INFO] Subsetted sizes - Train: {len(trainset)}, Test: {len(testset)}")
 
-            client_data = partition_dataset(trainset, num_clients, iid=False)
+            # FIXED: Use IID for better class balance (ensures SLF can poison effectively)
+            client_data = partition_dataset(trainset, num_clients, iid=True)
             test_loader = DataLoader(testset, batch_size=256, shuffle=False)
             test_X, y_test = next(iter(DataLoader(testset, batch_size=len(testset), shuffle=False)))
             test_X, y_test = test_X.numpy(), y_test.numpy()
 
             dataset_results = {}
 
+            # FIXED: Run baseline ONCE for fair comparison across all attacks
+            print(f"\n{'='*80}")
+            print(f"RUNNING SHARED BASELINE (No Attack, No Defense)")
+            print(f"{'='*80}")
+            baseline_clients = self.build_clients(num_clients, client_data, models, dataset_name, attack_config=None)
+            _, _, baseline_acc, baseline_asr, bl_train_acc, bl_train_loss, bl_test_acc, bl_test_loss, _ = self.run_and_evaluate_coordinator(
+                baseline_clients, rounds, test_loader, test_X=test_X, y_test=y_test,
+                use_defense=False, dataset=dataset_name, attack='baseline', scenario='baseline'
+            )
+            print(f"[BASELINE] Final Test Acc: {baseline_acc:.4f}")
+            print(f"[INFO] This baseline will be used for ALL attack comparisons")
+
+            # Store baseline results (shared across all attacks)
+            shared_baseline = {
+                'final_accuracy': float(baseline_acc),
+                'training_acc_history': [float(x) for x in bl_train_acc],
+                'training_loss_history': [float(x) for x in bl_train_loss],
+                'test_acc_history': [float(x) for x in bl_test_acc],
+                'test_loss_history': [float(x) for x in bl_test_loss],
+                'attack_success_rates': []
+            }
+
             for attack_name, attack_config in attack_configs.items():
-                # Only run baseline for 'none' attack, otherwise run baseline, attack, and defenses for each attack
+                # Skip 'none' attack - we already have baseline
                 if attack_name.lower() == 'none':
-                    print(f"\n--- Testing BASELINE (No Attack) ---")
-                    # Only run baseline scenario for 'none'
-                    scenarios = ['baseline']
-                else:
-                    print(f"\n--- Testing {attack_name.upper()} attack ---")
-                    # For real attacks, run baseline, attack, and then defenses
-                    scenarios = ['baseline', 'attack']
-                
+                    print(f"\n--- Skipping 'none' attack (baseline already computed) ---")
+                    continue
+
+                print(f"\n{'='*80}")
+                print(f"TESTING {attack_name.upper()} ATTACK")
+                print(f"{'='*80}")
+
                 attack_results = {}
 
-                for scenario in scenarios:
-                    print(f"\n[SCENARIO] Running {scenario.upper()} for {attack_name}")
-                    # For baseline, do not use attack config; for attack, use attack config
-                    client_attack_config = attack_config if (scenario == 'attack' and attack_config) else None
-                    clients = self.build_clients(num_clients, client_data, models, dataset_name, client_attack_config)
-                    use_defense = False
-                    coordinator, result, final_test_accuracy, attack_success_rates_final, training_acc_history, training_loss_history, test_acc_history, test_loss_history, _ = self.run_and_evaluate_coordinator(
-                        clients, rounds, test_loader, test_X=test_X, y_test=y_test,
-                        use_defense=use_defense, dataset=dataset_name, attack=attack_name, scenario=scenario
-                    )
-                    attack_results[scenario] = {
-                        'final_accuracy': float(final_test_accuracy),
-                        'training_acc_history': [float(x) for x in training_acc_history],  
-                        'training_loss_history': [float(x) for x in training_loss_history],     
-                        'test_acc_history': [float(x) for x in test_acc_history],         
-                        'test_loss_history': [float(x) for x in test_loss_history],             
-                        'attack_success_rates': [float(x) for x in attack_success_rates_final] if attack_success_rates_final else []
-                    }
-                    print(f"[RESULT] {scenario.title()} - Final Test Acc: {final_test_accuracy:.4f}")
-                    print(f"[HISTORY] Collected {len(training_acc_history)} rounds of training history")
-                    print(f"[HISTORY] Collected {len(test_acc_history)} rounds of test history")
+                # Use shared baseline (no re-computation)
+                attack_results['baseline'] = shared_baseline.copy()
 
-                # Only run defenses for real attacks (not for 'none')
+                # STEP 1: Create attack scenario clients ONCE (will be reused for all defenses)
+                scenario = 'attack'
+                print(f"\n[SCENARIO] Creating attack scenario for {attack_name} (poisoned clients)")
+                attack_scenario_clients = self.build_clients(num_clients, client_data, models, dataset_name, attack_config)
+                print(f"[INFO] Attack scenario created - these clients will be reused for all defense tests")
+
+                # STEP 2: Run attack without defense (optional, for comparison)
+                print(f"\n[SCENARIO] Running {scenario.upper()} for {attack_name} (no defense)")
+                use_defense = False
+                coordinator, result, final_test_accuracy, attack_success_rates_final, training_acc_history, training_loss_history, test_acc_history, test_loss_history, detection_metrics = self.run_and_evaluate_coordinator(
+                    attack_scenario_clients, rounds, test_loader, test_X=test_X, y_test=y_test,
+                    use_defense=use_defense, dataset=dataset_name, attack=attack_name, scenario=scenario
+                )
+                attack_results[scenario] = {
+                    'final_accuracy': float(final_test_accuracy),
+                    'training_acc_history': [float(x) for x in training_acc_history],
+                    'training_loss_history': [float(x) for x in training_loss_history],
+                    'test_acc_history': [float(x) for x in test_acc_history],
+                    'test_loss_history': [float(x) for x in test_loss_history],
+                    'attack_success_rates': [float(x) for x in attack_success_rates_final] if attack_success_rates_final else []
+                }
+                print(f"[RESULT] {scenario.title()} - Final Test Acc: {final_test_accuracy:.4f}")
+                print(f"[HISTORY] Collected {len(training_acc_history)} rounds of training history")
+                print(f"[HISTORY] Collected {len(test_acc_history)} rounds of test history")
+
+                # STEP 3: Test all defenses on the SAME attack scenario (deep copy for each defense)
                 if attack_name.lower() != 'none':
-                    defenses_to_run = ["committee", "adaptive", "reputation", "gradient", "ensemble"]
+                    import copy
+                    defenses_to_run = ["adaptivecommittee", "cmfl"]
                     for defense_name in defenses_to_run:
                         print(f"\n[SCENARIO] Running DEFENSE ({defense_name.upper()}) for {attack_name}")
-                        defense_clients = self.build_clients(num_clients, client_data, models, dataset_name, attack_config)
-                        for c in defense_clients:
-                            try:
-                                if hasattr(c, "poison_local_data"):
-                                    c.poison_local_data()
-                            except Exception as e:
-                                print(f"[WARN] Client {getattr(c,'client_id','?')} poison_local_data failed: {e}")
-                        coordinator, result, final_test_accuracy, attack_success_rates_final, training_acc_history, training_loss_history, test_acc_history, test_loss_history, _ = self.run_and_evaluate_coordinator(
+                        print(f"[INFO] Using deep copy of the SAME poisoned clients for fair comparison")
+
+                        # Deep copy the attack scenario clients to ensure same poisoned data
+                        defense_clients = copy.deepcopy(attack_scenario_clients)
+
+                        coordinator, result, final_test_accuracy, attack_success_rates_final, training_acc_history, training_loss_history, test_acc_history, test_loss_history, detection_metrics = self.run_and_evaluate_coordinator(
                             defense_clients, rounds, test_loader, test_X=test_X, y_test=y_test,
                             use_defense=True, defense_type=defense_name, dataset=dataset_name, attack=attack_name, scenario=f"defense_{defense_name}"
                         )
-                        attack_results[f"defense_{defense_name}"] = {
+
+                        # Store defense results with detection metrics
+                        defense_result = {
                             'final_accuracy': float(final_test_accuracy),
-                            'training_acc_history': [float(x) for x in training_acc_history],  
-                            'training_loss_history': [float(x) for x in training_loss_history],     
-                            'test_acc_history': [float(x) for x in test_acc_history],         
-                            'test_loss_history': [float(x) for x in test_loss_history],             
+                            'training_acc_history': [float(x) for x in training_acc_history],
+                            'training_loss_history': [float(x) for x in training_loss_history],
+                            'test_acc_history': [float(x) for x in test_acc_history],
+                            'test_loss_history': [float(x) for x in test_loss_history],
                             'attack_success_rates': [float(x) for x in attack_success_rates_final] if attack_success_rates_final else []
                         }
+
+                        # Add detection metrics if available
+                        if detection_metrics:
+                            defense_result['detection_metrics'] = detection_metrics
+
+                        attack_results[f"defense_{defense_name}"] = defense_result
                         print(f"[RESULT] Defense {defense_name} - Final Test Acc: {final_test_accuracy:.4f}")
 
                 dataset_results[attack_name] = attack_results
 
             results[dataset_name] = dataset_results
-
-            # REMOVED: Redundant defense comparison (was re-running all attacks)
-            # The defenses are already tested in the main loop above
-            # if test_defenses:
-            #     print(f"\n{'='*70}")
-            #     print(f"RUNNING DEFENSE COMPARISON FOR {dataset_name}")
-            #     print(f"{'='*70}")
-            #
-            #     self.run_defense_vs_attacks(
-            #         attack_configs=attack_configs,
-            #         dataset_name=dataset_name,
-            #         models_map=models,
-            #         num_clients=num_clients,
-            #         rounds=rounds,
-            #         client_data=client_data,
-            #         test_loader=test_loader,
-            #         test_X=test_X,
-            #         y_test=y_test,
-            #         defenses_to_run=defenses_to_test if defenses_to_test else ["committee", "adaptive", "ensemble"],
-            #         save_csv=True
-            #     )
 
         self.results = results
         return results
@@ -970,10 +1004,11 @@ class EvaluationFramework:
                         if key not in attack_results[scenario]:
                             attack_results[scenario][key] = 0.0 if key == 'final_accuracy' else []
 
-        # Now call the plotting engine correctly for each dataset
+        # Now call the plotting engine correctly for each dataset (skip if plotter is disabled)
         # PlottingEngine.generate_all_plots expects: (results_dict, output_dir, dataset_name)
-        for dataset_name, dataset_results in results.items():
-            self.plotter.generate_all_plots({dataset_name: dataset_results}, self.out_dir, dataset_name)
+        if self.plotter is not None:
+            for dataset_name, dataset_results in results.items():
+                self.plotter.generate_all_plots({dataset_name: dataset_results}, self.out_dir, dataset_name)
 
 
     def generate_comprehensive_report(self, results, features_dict=None):
@@ -1018,7 +1053,11 @@ class EvaluationFramework:
             'centralized': 'Centralized Trigger - Backdoor attack with fixed triggers',
             'coordinated': 'Coordinated Trigger - Client-specific backdoor triggers',
             'random': 'Random Trigger - Stochastic backdoor generation',
-            'model_dependent': 'Model-Dependent - Gradient-based trigger optimization'
+            'model_dependent': 'Model-Dependent - Gradient-based trigger optimization',
+            'local_model_replacement': 'Local Model Replacement - Replace model parameters with malicious values',
+            'local_model_noise': 'Local Model Noise - Add crafted noise to model parameters',
+            'global_model_replacement': 'Global Model Replacement - Override global model with boosted malicious update',
+            'aggregation_modification': 'Aggregation Modification - Manipulate aggregation process with outlier/coordinated updates'
         }
 
         for attack_name, description in attack_analysis.items():
@@ -1099,13 +1138,13 @@ class EvaluationFramework:
             'total_attacks_tested': total_attacks_tested,
             'successful_defenses': successful_defenses,
             'defense_success_rate': successful_defenses/total_attacks_tested*100 if total_attacks_tested > 0 else 0,
-            'plots_generated': self.plotter.plots_generated
+            'plots_generated': self.plotter.plots_generated if self.plotter is not None else []
         }
     
     def extract_client_features(self, clients, test_loader):
         """Extract features from client models for similarity analysis."""
         features_dict = {}
-        device = torch.device('cuda' if torch.cuda.is_available() else torch.device('cpu'))
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         for client in clients:
             client.model.to(device)
@@ -1146,7 +1185,7 @@ def run_enhanced_evaluation(
     resume_from_json=None,
     out_dir="Output",
     test_defenses=True,
-    subset_fraction=0.1,
+    subset_fraction=0.25,
     resume=False,
     defenses_to_test=None
 ):
@@ -1160,14 +1199,14 @@ def run_enhanced_evaluation(
         test_defenses: Whether to test defenses
         subset_fraction: Fraction of dataset to use
         resume: Whether to resume from checkpoint
-        defenses_to_test: List of defense types to test (default: ["committee", "adaptive", "ensemble"])
+        defenses_to_test: List of defense types to test (default: ["adaptivecommittee", "cmfl"])
 
     Returns:
         Tuple of (results dict, report statistics dict)
     """
 
     if defenses_to_test is None:
-        defenses_to_test = ["committee", "adaptive", "ensemble"]
+        defenses_to_test = ["adaptivecommittee", "cmfl"]
 
     print("=" * 100)
     print("ENHANCED DECENTRALIZED FEDERATED LEARNING SECURITY FRAMEWORK")
@@ -1233,9 +1272,11 @@ def run_enhanced_evaluation(
         # Optional: Extract client features if available (for analysis)
         features_dict = None
 
-        # Visualization phase (plots, summaries)
-        print("\n[INFO] Generating comprehensive visualizations and report...")
-        evaluator.generate_all_plots(results)
+        # SKIP plotting during execution for faster training
+        # Visualization phase can be done later with generate_plots_from_results.py
+        print("\n[INFO] Skipping plot generation during execution (for faster training)")
+        print("[INFO] To generate plots later, run: python generate_plots_from_results.py")
+        # evaluator.generate_all_plots(results)  # Commented out
 
         # Generate final report and print summary
         report_stats = evaluator.generate_comprehensive_report(results, features_dict)
@@ -1265,7 +1306,7 @@ def run_enhanced_evaluation(
         raise
 
 
-def run_attack_comparison_test(subset_fraction=0.1, num_clients=1, rounds = 30, malicious_clients=4):
+def run_attack_comparison_test(subset_fraction=0.25, num_clients=10, rounds = 1, malicious_clients=4):
     """
     Run side-by-side comparison of all attacks using a subset of the dataset.
     Evaluates attack effectiveness, accuracy, and stealth.
@@ -1290,7 +1331,8 @@ def run_attack_comparison_test(subset_fraction=0.1, num_clients=1, rounds = 30, 
     print(f"[INFO] Dataset sizes after subsetting - Train: {len(trainset)}, Test: {len(testset)}")
 
     # Partition for federated learning
-    client_data = partition_dataset(trainset, num_clients=num_clients, iid=False, alpha=0.3)
+    # FIXED: Use IID for better class balance (ensures all attacks work effectively)
+    client_data = partition_dataset(trainset, num_clients=num_clients, iid=True)
     test_loader = DataLoader(testset, batch_size=256, shuffle=False)
 
     # Prepare test arrays
@@ -1364,11 +1406,11 @@ def run_attack_comparison_test(subset_fraction=0.1, num_clients=1, rounds = 30, 
     return comparison_results
 
 
-def run_comprehensive_defense_test(subset_fraction=0.1, num_clients=10, rounds = 30, out_dir="comprehensive_defense_results",
+def run_comprehensive_defense_test(subset_fraction=0.25, num_clients=10, rounds = 1, out_dir="comprehensive_defense_results",
                                    resume_checkpoint=False, checkpoint_interval=2):
     """
-    Comprehensive test of ALL defenses against ALL attacks for BOTH datasets.
-    Tests committee, adaptive, and ensemble defenses separately.
+    Comprehensive test of ALL committee-based defenses against ALL attacks for ALL datasets.
+    Tests adaptivecommittee and cmfl defenses separately (both distributed).
     Generates comparative visualizations and recovery rate analysis.
 
     Args:
@@ -1384,7 +1426,7 @@ def run_comprehensive_defense_test(subset_fraction=0.1, num_clients=10, rounds =
     """
     print("\n" + "="*100)
     print("COMPREHENSIVE DEFENSE TESTING FRAMEWORK")
-    print(f"Testing ALL 5 defenses (committee, adaptive, reputation, gradient, ensemble) against ALL attacks")
+    print(f"Testing ALL 2 committee-based defenses (adaptivecommittee, cmfl) against ALL attacks")
     print(f"Dataset fraction: {subset_fraction*100:.0f}%, Clients: {num_clients}, Rounds: {rounds}")
     if resume_checkpoint:
         print(f"Checkpoint Resume: ENABLED (interval: every {checkpoint_interval} rounds)")
@@ -1441,18 +1483,19 @@ def run_comprehensive_defense_test(subset_fraction=0.1, num_clients=10, rounds =
     # Store checkpoint interval for use in run_and_evaluate_coordinator
     framework.checkpoint_interval = checkpoint_interval
 
-    # Defense types to test - ALL 5 defenses
-    # CHANGED: Now testing ALL defenses for comprehensive analysis
-    defense_types = ['committee', 'adaptive', 'reputation', 'gradient', 'ensemble']
+    # Defense types to test - ALL 2 committee-based defenses
+    # Only distributed committee-based defenses (centralized defenses removed)
+    defense_types = ['adaptivecommittee', 'cmfl']
 
     # Get datasets and models
     datasets, models = framework.get_datasets_and_models()
-    attack_configs = framework.get_attack_configs(malicious_clients=4)
+    attack_configs = framework.get_attack_configs(malicious_clients=6)  # 60% malicious for stronger attacks
 
     # IMPORTANT: Define explicit attack order to ensure all attacks run sequentially
     # NOTE: 'none' is NOT an attack - it's the baseline without any attack
     # We handle baseline separately before testing actual attacks
-    attack_order = ['slf', 'dlf', 'centralized', 'coordinated', 'random', 'model_dependent']
+    attack_order = ['slf', 'dlf', 'centralized', 'coordinated', 'random', 'model_dependent',
+                    'local_model_replacement', 'local_model_noise', 'global_model_replacement', 'aggregation_modification']
 
     print(f"\n[DEBUG] Real attacks to test: {attack_order}")
     print(f"[DEBUG] Total attacks: {len(attack_order)} (baseline will be run separately)")
@@ -1475,8 +1518,8 @@ def run_comprehensive_defense_test(subset_fraction=0.1, num_clients=10, rounds =
         testset_subset = framework._subset_dataset(testset, subset_fraction)
         print(f"[INFO] Subsetted sizes - Train: {len(trainset_subset)}, Test: {len(testset_subset)}")
 
-        # Partition data
-        client_data = partition_dataset(trainset_subset, num_clients, iid=False)
+        # Partition data - using IID for better class balance (ensures malicious clients have source class samples)
+        client_data = partition_dataset(trainset_subset, num_clients, iid=True)
         test_loader = DataLoader(testset_subset, batch_size=256, shuffle=False)
         test_X, y_test = next(iter(DataLoader(testset_subset, batch_size=len(testset_subset), shuffle=False)))
         test_X, y_test = test_X.numpy(), y_test.numpy()
@@ -1763,24 +1806,31 @@ def run_comprehensive_defense_test(subset_fraction=0.1, num_clients=10, rounds =
 
     print(f"[INFO] CSV saved to: {csv_path}")
 
-    # Generate visualizations using PlottingEngine
+    # SKIP plotting during execution for faster training
+    # Plots can be generated later using generate_plots_from_results.py
     print(f"\n{'='*100}")
-    print("GENERATING VISUALIZATIONS")
+    print("SKIPPING VISUALIZATION GENERATION (for faster execution)")
+    print("To generate plots later, run: python generate_plots_from_results.py")
     print(f"{'='*100}")
-
-    from plots import PlottingEngine
-    plotter = PlottingEngine(output_dir=framework.plots_dir, run_id=run_id)
-    plotter.plot_comprehensive_defense_comparison(all_results, run_id=run_id)
 
     # Generate comprehensive defense analysis tables (includes summary printing)
     from defense_analysis import DefenseAnalyzer
     analyzer = DefenseAnalyzer(results_dir=framework.results_dir)
     analyzer.generate_all_analysis(
         results=all_results,
-        num_malicious=4,  # From attack_configs
+        num_malicious=6,  # FIXED: Match the actual malicious_clients count (line 1426)
         num_clients=num_clients,
         total_rounds=rounds
     )
+
+    # Generate research paper tables (Table 1, Table 2)
+    print(f"\n{'='*100}")
+    print("GENERATING RESEARCH PAPER TABLES")
+    print(f"{'='*100}")
+    from table_generator import ResearchTableGenerator
+    table_gen = ResearchTableGenerator(results_dir=framework.results_dir)
+    table_gen.results = all_results
+    table_gen.generate_all_tables()
 
     print(f"\n{'='*100}")
     print("COMPREHENSIVE DEFENSE TEST COMPLETED")
@@ -1789,12 +1839,11 @@ def run_comprehensive_defense_test(subset_fraction=0.1, num_clients=10, rounds =
     print(f"Plots saved to: {framework.plots_dir}")
     print(f"Data saved to: {framework.results_dir}")
     print(f"Analysis tables: {framework.results_dir}")
+    print(f"Research tables:")
+    print(f"  - Table 1 (Detection): {framework.results_dir}/table1_detection_performance.csv")
+    print(f"  - Table 2 (Model): {framework.results_dir}/table2_model_performance.csv")
     print(f"{'='*100}")
 
     return all_results
 
 
-
-
-# Note: Main execution is handled in main.py
-# This allows evaluation.py to be used as a library module

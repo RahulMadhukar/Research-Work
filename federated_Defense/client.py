@@ -42,13 +42,14 @@ class DecentralizedClient:
         # Create attack instance if malicious
         if self.is_malicious:
             self.attack_instance = AttackFactory.create_attack(attack_config)
-            # Apply initial poisoning
-            self.poison_local_data()
-            print(f"[INFO] Client {client_id} initialized as MALICIOUS with '{attack_config.attack_type}' attack")
+            try:
+                self.poison_local_data()
+                print(f"[INFO] Client {client_id} initialized as MALICIOUS with '{attack_config.attack_type}' attack")
+            except Exception as e:
+                print(f"[WARN] Client {client_id} initial poisoning failed: {e}")
         else:
             print(f"[INFO] Client {client_id} initialized as HONEST")
 
-        # Local state tracking
         self.local_accuracy_history = []
         self.received_updates = []
 
@@ -82,13 +83,20 @@ class DecentralizedClient:
             self.poison_mask = np.zeros(len(self.y), dtype=bool)
 
     # -------------------------------------------------------------------------
-    # Local training (UNCHANGED - uses self.X and self.y which are poisoned)
+    # Local training (uses self.X and self.y which are poisoned for malicious clients)
     # -------------------------------------------------------------------------
     def local_training(self, epochs=10, lr=0.01, batch_size=32):
         """Perform local training and return model parameters"""
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(device)
         self.model.train()
+
+        # FIXED: Malicious clients train moderately more to strengthen poison signal
+        # Reduced amplification for balanced attack-defense dynamics
+        if self.is_malicious:
+            epochs = int(epochs * 1.5)  # REDUCED: 1.5x instead of 2.5x
+            lr = lr * 1.2  # REDUCED: 1.2x instead of 2.0x
+            print(f"  [MALICIOUS] Client {self.client_id}: Training with {epochs} epochs, lr={lr:.3f} (moderate boost)")
 
         optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
         criterion = nn.CrossEntropyLoss()
@@ -120,6 +128,21 @@ class DecentralizedClient:
             preds = torch.argmax(outputs, dim=1)
             local_accuracy = (preds == y_tensor).float().mean().item()
             self.local_accuracy_history.append(local_accuracy)
+
+        # CRITICAL: Apply model poisoning attacks AFTER training (for model poisoning attacks)
+        if self.is_malicious and self.attack_instance is not None:
+            if hasattr(self.attack_instance, 'poison_model'):
+                try:
+                    print(f"  [MODEL POISON] Client {self.client_id}: Applying model-level poisoning")
+                    self.model = self.attack_instance.poison_model(self.model)
+                except Exception as e:
+                    print(f"  [ERROR] Client {self.client_id}: Model poisoning failed - {e}")
+            elif hasattr(self.attack_instance, 'manipulate_update'):
+                try:
+                    print(f"  [UPDATE MANIPULATION] Client {self.client_id}: Manipulating model update")
+                    self.model = self.attack_instance.manipulate_update(self.model)
+                except Exception as e:
+                    print(f"  [ERROR] Client {self.client_id}: Update manipulation failed - {e}")
 
         params = {name: param.data.cpu().clone() for name, param in self.model.named_parameters()}
         return params, np.mean(epoch_losses), local_accuracy

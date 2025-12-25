@@ -1,6 +1,9 @@
-# Suppress OpenBLAS warnings
+# FIX: Set thread limits BEFORE importing numpy/torch to prevent OpenBLAS warnings
 import os
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
 import argparse
 from evaluation import run_enhanced_evaluation, run_attack_comparison_test, run_comprehensive_defense_test
@@ -17,18 +20,18 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, help="Path to saved JSON results to resume from")
     parser.add_argument("--resume-checkpoint", action='store_true',
                         help="Resume from last checkpoint (comprehensive mode)")
-    parser.add_argument("--checkpoint-interval", type=int, default=2,
-                        help="Save checkpoint every N rounds (default: 2)")
+    parser.add_argument("--checkpoint-interval", type=int, default=5,
+                        help="Save checkpoint every N rounds (default: 5)")
     parser.add_argument("--outdir", type=str, default="plots", help="Base directory for saving results")
     parser.add_argument("--defenses", type=str, nargs='+',
-                        default=["committee", "adaptive","reputation", "gradient", "ensemble"],
-                        choices=["committee", "adaptive", "reputation", "gradient", "ensemble", "all"],
-                        help="Defense types to test (standard mode)")
-    parser.add_argument("--subset", type=float, default=0.1,
+                        default=["adaptivecommittee", "cmfl"],
+                        choices=["adaptivecommittee", "cmfl", "all"],
+                        help="Defense types to test (standard mode - both committee-based)")
+    parser.add_argument("--subset", type=float, default=0.25,
                         help="Dataset subset fraction (0.1 = 10%%)")
     parser.add_argument("--clients", type=int, default=10,
                         help="Number of clients (comprehensive mode)")
-    parser.add_argument("--rounds", type=int, default=10,
+    parser.add_argument("--rounds", type=int, default=20,
                         help="Number of FL rounds (comprehensive mode)")
     parser.add_argument("--no-defense", action='store_true',
                         help="Skip defense testing (attack-only evaluation, standard mode)")
@@ -54,12 +57,9 @@ if __name__ == "__main__":
         print(f"  Dataset subset: {args.subset*100:.0f}%")
         print(f"  Number of clients: {args.clients}")
         print(f"  FL rounds: {args.rounds}")
-        print(f"\nTesting ALL 5 defenses:")
-        print(f"  ✓ Committee Defense")
-        print(f"  ✓ Adaptive Defense")
-        print(f"  ✓ Reputation System Defense")
-        print(f"  ✓ Gradient Analyzer Defense")
-        print(f"  ✓ Ensemble Defense (combines all above)")
+        print(f"\nTesting ALL 2 committee-based defenses:")
+        print(f"  ✓ Adaptive Committee Defense (AdaptiveCommitteeDefense)")
+        print(f"  ✓ CMFL Defense (CMFLDefense)")
         print(f"\nAgainst ALL attacks:")
         print(f"  ✓ Static Label Flipping (SLF)")
         print(f"  ✓ Dynamic Label Flipping (DLF)")
@@ -67,8 +67,10 @@ if __name__ == "__main__":
         print(f"  ✓ Coordinated Backdoor")
         print(f"  ✓ Random Backdoor")
         print(f"  ✓ Model-Dependent Attack")
-        print(f"\nFor both datasets:")
+        print(f"\nFor all 4 datasets:")
+        print(f"  ✓ MNIST")
         print(f"  ✓ Fashion-MNIST")
+        print(f"  ✓ EMNIST")
         print(f"  ✓ CIFAR-10")
         print("="*100)
 
@@ -101,7 +103,7 @@ if __name__ == "__main__":
     else:
         # Parse defenses
         if "all" in args.defenses:
-            defenses_to_test = ["committee", "adaptive","reputation", "gradient", "ensemble"]
+            defenses_to_test = ["adaptivecommittee", "cmfl"]
         else:
             defenses_to_test = args.defenses
 

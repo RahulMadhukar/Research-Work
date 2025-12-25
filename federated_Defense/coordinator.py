@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from typing import List, Dict, Optional
 from collections import defaultdict
-from defense import EnsembleDefense, AdaptiveCommitteeDefense, ReputationSystem, GradientAnalyzer
+from defense import AdaptiveCommitteeDefense, CMFLDefense
 
 
 class DecentralizedFLCoordinator:
@@ -16,42 +16,37 @@ class DecentralizedFLCoordinator:
     - Provides evaluation capabilities for attack success rates
     """
 
-    def __init__(self, clients, use_committee_defense=True, num_peers=3, defense_type='committee'):
+    def __init__(self, clients, use_defense=True, num_peers=3, defense_type='adaptivecommittee', **defense_kwargs):
         """
         Initialize the federated learning coordinator.
 
         Args:
             clients: List of DecentralizedClient instances
-            use_committee_defense: Whether to use committee defense (default: True)
+            use_defense: Whether to use committee defense (default: True)
             num_peers: Number of peers for decentralized communication (unused in current impl)
-            defense_type: Type of defense ('committee', 'ensemble', 'adaptive', 'none')
+            defense_type: Type of defense ('adaptivecommittee', 'cmfl', 'none')
+            **defense_kwargs: Additional arguments for specific defense types
         """
         self.clients = clients
-        self.use_committee_defense = use_committee_defense
+        self.use_defense = use_defense
         self.defense_type = defense_type
 
-        # Initialize appropriate defense mechanism
-        if use_committee_defense:
-            if defense_type == 'ensemble':
-                self.defense = EnsembleDefense(num_clients=len(clients))
-                self.committee_defense = self.defense.adaptive_committee  # For compatibility
-                print(f"[DEFENSE] Using Ensemble Defense (Committee + Reputation + Gradient Analysis)")
-            elif defense_type == 'adaptive':
-                self.defense = AdaptiveCommitteeDefense()
-                self.committee_defense = self.defense  # For compatibility
-                print(f"[DEFENSE] Using Adaptive Committee Defense")
-            elif defense_type == 'reputation':
-                self.defense = ReputationSystem(num_clients=len(clients))
-                self.committee_defense = self.defense  # For compatibility
-                print(f"[DEFENSE] Using Reputation System Defense")
-            elif defense_type == 'gradient':
-                self.defense = GradientAnalyzer()
-                self.committee_defense = self.defense  # For compatibility
-                print(f"[DEFENSE] Using Gradient Analyzer Defense")
+        # Initialize appropriate defense mechanism (Committee-Based Only)
+        print(f"[DEBUG] Initializing defense: use_defense={use_defense}, defense_type='{defense_type}'")
+        if use_defense:
+            if defense_type == 'cmfl':
+                # CMFL defense with rotating committee
+                self.defense = CMFLDefense(
+                    num_clients=len(clients),
+                    **defense_kwargs
+                )
+                self.committee_defense = None  # CMFL uses different workflow
+                print(f"[DEFENSE] ✓ Using CMFL (Committee-based Federated Learning)")
             else:
-                self.defense = AdaptiveCommitteeDefense()
+                # Default: 'adaptivecommittee' or any unrecognized type uses adaptive committee
+                self.defense = AdaptiveCommitteeDefense(num_clients=len(clients))
                 self.committee_defense = self.defense  # For compatibility
-                print(f"[DEFENSE] Using Standard Committee Defense")
+                print(f"[DEFENSE] ✓ Using Adaptive Committee Defense (defense_type='{defense_type}')")
         else:
             self.defense = None
             self.committee_defense = None
@@ -72,30 +67,31 @@ class DecentralizedFLCoordinator:
             'false_positive_rate': 0.0
         }
 
-        # Track enhanced defense metrics
+        # Track enhanced defense metrics (Committee-based only)
         self.enhanced_metrics = {
             'reputation_scores': [],
-            'gradient_norms': [],
             'adaptive_thresholds': [],
             'defense_stats': []
         }
 
     def run_federated_learning(self, rounds=10, aggregation_method='mean',
-                               test_loader=None, model_constructor=None):
+                               test_loader=None, model_constructor=None, round_offset=0, total_rounds=None):
         """
         Run decentralized FL for the given number of rounds.
-        
+
         Args:
-            rounds: Number of federated learning rounds
+            rounds: Number of federated learning rounds to execute in this call
             aggregation_method: Aggregation method ('mean' or 'median') - only used if defense disabled
             test_loader: Optional test data loader for evaluation
             model_constructor: Optional model constructor for evaluation
-            
+            round_offset: Offset for round numbering (used when calling with rounds=1 in a loop)
+            total_rounds: Total number of rounds in the entire training (for display purposes)
+
         Returns:
             Tuple of (accuracy_history, loss_history, round_history)
         """
         print(f"\nStarting decentralized FL with {len(self.clients)} clients")
-        print(f"Committee defense: {'Enabled ✓' if self.use_committee_defense else 'Disabled ✗'}")
+        print(f"Committee defense: {'Enabled ✓' if self.use_defense else 'Disabled ✗'}")
         print(f"Aggregation method: {aggregation_method}")
         
         # Identify malicious clients
@@ -111,15 +107,26 @@ class DecentralizedFLCoordinator:
         loss_history = []
 
         for round_num in range(rounds):
-            print(f"\n{'='*60}")
-            print(f"Round {round_num + 1}/{rounds}")
-            print(f"{'='*60}")
+            current_round = round_num + 1 + round_offset
+            # Use provided total_rounds if specified, otherwise calculate it
+            display_total_rounds = total_rounds if total_rounds is not None else (rounds + round_offset)
+
+            # Note: Round header is printed by the calling function (evaluation.py or run_impact_analysis.py)
+            # to avoid duplicate printing
+
+            # CMFL-specific: Activate training clients
+            if self.defense_type == 'cmfl':
+                training_client_ids = self.defense.activate_training_clients()
+                active_client_ids = training_client_ids + list(self.defense.committee_members)
+            else:
+                # Non-CMFL: All clients train
+                active_client_ids = list(range(len(self.clients)))
 
             # Re-apply attacks each round (for malicious clients)
             if malicious_count > 0:
-                print(f"[ROUND {round_num + 1}] Applying attacks to make malicious clients...")
+                print(f"[ROUND {current_round}] Applying attacks to malicious clients...")
                 for client in self.clients:
-                    if client.is_malicious:
+                    if client.is_malicious and client.client_id in active_client_ids:
                         try:
                             client.poison_local_data()
                             num_poisoned = np.sum(client.poison_mask) if hasattr(client, 'poison_mask') else 0
@@ -127,20 +134,35 @@ class DecentralizedFLCoordinator:
                         except Exception as e:
                             print(f"  ✗ Client {client.client_id}: Poisoning failed - {e}")
 
-            # Local training on all clients
+            # Local training (only active clients for CMFL, all clients otherwise)
             local_updates = []
             client_losses = []
             client_accuracies = []
-            
-            for client in self.clients:
-                params, loss, acc = client.local_training()
-                local_updates.append(params)
-                client_losses.append(loss)
-                client_accuracies.append(acc)
+            client_id_to_update = {}  # For CMFL: map client_id -> update
 
-                # Log malicious participation
-                if getattr(client, 'is_malicious', False):
-                    self.poisoned_participation_log[client.client_id].append(round_num + 1)
+            for client in self.clients:
+                if client.client_id in active_client_ids:
+                    params, loss, acc = client.local_training()
+
+                    if self.defense_type == 'cmfl':
+                        # CMFL: Store by client_id for dict access
+                        client_id_to_update[client.client_id] = params
+                        client_losses.append(loss)
+                        client_accuracies.append(acc)
+                    else:
+                        # Non-CMFL: Store as list
+                        local_updates.append(params)
+                        client_losses.append(loss)
+                        client_accuracies.append(acc)
+
+                    # Log malicious participation
+                    if getattr(client, 'is_malicious', False):
+                        self.poisoned_participation_log[client.client_id].append(current_round)
+                elif self.defense_type != 'cmfl':
+                    # Non-CMFL: Include all clients (shouldn't happen but for safety)
+                    local_updates.append(None)
+                    client_losses.append(0.0)
+                    client_accuracies.append(0.0)
 
             print(f"Local accuracies: {[f'{acc:.3f}' for acc in client_accuracies]}")
             print(f"Local losses: {[f'{loss:.3f}' for loss in client_losses]}")
@@ -149,24 +171,23 @@ class DecentralizedFLCoordinator:
             anomalous_clients = []
             defense_metrics = {}
 
-            if self.use_committee_defense:
+            if self.use_defense:
                 print(f"\n[DEFENSE] Running {self.defense_type.upper()} defense...")
 
                 # Use appropriate defense strategy
-                if self.defense_type == 'ensemble':
-                    # Ensemble defense with all components
-                    global_params, anomalous_clients, defense_metrics = self.defense.defend_and_aggregate(
-                        local_updates,
-                        client_losses
+                if self.defense_type == 'cmfl':
+                    # CMFL defense workflow
+                    # Convert losses to dict format
+                    client_losses_dict = {cid: client_losses[i] for i, cid in enumerate(active_client_ids)}
+
+                    global_params, anomalous_clients, defense_metrics = self.defense.cmfl_round(
+                        client_id_to_update,
+                        client_losses_dict
                     )
 
-                    # Track enhanced metrics
+                    # Track CMFL metrics
                     self.enhanced_metrics['defense_stats'].append(defense_metrics)
                     self.enhanced_metrics['reputation_scores'].append(defense_metrics.get('reputation_scores', {}))
-                    if 'gradient_analysis' in defense_metrics:
-                        self.enhanced_metrics['gradient_norms'].append(defense_metrics['gradient_analysis'].get('grad_norms', []))
-                    if 'adaptive_threshold' in defense_metrics:
-                        self.enhanced_metrics['adaptive_thresholds'].append(defense_metrics['adaptive_threshold'])
 
                 elif self.defense_type == 'adaptive':
                     # Adaptive committee defense
@@ -235,15 +256,15 @@ class DecentralizedFLCoordinator:
 
             # Store round information
             self.round_history.append({
-                'round': round_num + 1,
+                'round': current_round,
                 'client_accuracies': client_accuracies.copy(),
                 'avg_accuracy': avg_accuracy,
                 'client_losses': client_losses.copy(),
                 'avg_loss': avg_loss,
                 'anomalous_clients': anomalous_clients.copy()
             })
-            
-            print(f"\n[ROUND {round_num + 1} SUMMARY]")
+
+            print(f"\n[ROUND {current_round} SUMMARY]")
             print(f"  Avg training accuracy: {avg_accuracy:.4f}")
             print(f"  Avg training loss: {avg_loss:.4f}")
 
@@ -253,7 +274,7 @@ class DecentralizedFLCoordinator:
         print(f"{'='*60}")
         
         # Print defense effectiveness summary
-        if self.use_committee_defense:
+        if self.use_defense:
             self._print_defense_summary()
 
         print(f"\nFinal Summary:")
@@ -265,32 +286,44 @@ class DecentralizedFLCoordinator:
     def _aggregate_updates(self, client_updates, method='mean'):
         """
         Simple aggregation without defense.
-        
+
         Args:
             client_updates: List of client parameter updates
-            method: Aggregation method ('mean' or 'median')
-            
+            method: Aggregation method ('mean', 'median', 'fedavg', 'krum', 'trimmed_mean')
+
         Returns:
             Aggregated parameters
         """
+        # Map common names to supported methods
+        method_lower = method.lower()
+        if method_lower == 'fedavg':
+            method_lower = 'mean'  # FedAvg is standard mean aggregation
+
+        # For robust aggregation methods (krum, trimmed_mean), use defense.py implementations
+        if method_lower in ['krum', 'trimmed_mean']:
+            from defense import get_aggregation_method
+            aggregator = get_aggregation_method(method_lower)
+            return aggregator.aggregate(client_updates)
+
+        # Standard aggregation methods
         aggregated_params = {}
         param_names = client_updates[0].keys()
-        
+
         for name in param_names:
             param_stack = torch.stack([update[name] for update in client_updates])
-            if method == 'mean':
+            if method_lower == 'mean':
                 aggregated_params[name] = torch.mean(param_stack, dim=0)
-            elif method == 'median':
+            elif method_lower == 'median':
                 aggregated_params[name] = torch.median(param_stack, dim=0).values
             else:
                 raise ValueError(f"Unknown aggregation method: {method}")
-        
+
         return aggregated_params
 
     def _update_committee_metrics(self, actual_malicious, detected_malicious):
         """
         Update committee defense performance metrics.
-        
+
         Args:
             actual_malicious: List of actual malicious client IDs
             detected_malicious: List of detected malicious client IDs
@@ -299,14 +332,17 @@ class DecentralizedFLCoordinator:
         actual_set = set(actual_malicious)
         detected_set = set(detected_malicious)
         total_clients = len(self.clients)
-        
+
+        # Store actual malicious IDs (needed for get_committee_metrics)
+        self.committee_metrics['actual_malicious'] = list(actual_malicious)
+
         # Calculate metrics
         if len(actual_malicious) > 0:
             true_positives = len(actual_set & detected_set)
             self.committee_metrics['detection_rate'] = true_positives / len(actual_malicious)
         else:
             self.committee_metrics['detection_rate'] = 0.0
-        
+
         # False positive rate
         benign_clients = total_clients - len(actual_malicious)
         if benign_clients > 0:
@@ -352,22 +388,82 @@ class DecentralizedFLCoordinator:
         else:
             print(f"  Recall: N/A (no malicious clients)")
         
+        # Get full metrics including TP, TN, FP, FN
+        full_metrics = self.get_committee_metrics()
+
         # Overall rates
         print(f"  Detection Rate: {self.committee_metrics['detection_rate']:.2%}")
         print(f"  False Positive Rate: {self.committee_metrics['false_positive_rate']:.2%}")
+        print(f"  False Negative Rate: {full_metrics['false_negative_rate']:.2f}%")
+        print(f"  Precision: {full_metrics['precision']:.2f}%")
+        print(f"  Recall: {full_metrics['recall']:.2f}%")
+
+        # Confusion Matrix Elements
+        print(f"\n  Confusion Matrix:")
+        print(f"    True Positives (TP):  {full_metrics['true_positives']}")
+        print(f"    True Negatives (TN):  {full_metrics['true_negatives']}")
+        print(f"    False Positives (FP): {full_metrics['false_positives']}")
+        print(f"    False Negatives (FN): {full_metrics['false_negatives']}")
 
     def get_committee_metrics(self):
         """
         Get committee defense performance metrics for evaluation.
-        
+
         Returns:
-            Dictionary containing detection_rate and false_positive_rate
+            Dictionary containing detection_rate, false_positive_rate, TP, TN, FP, FN, and raw counts
         """
+        # Get actual malicious IDs - fallback to getting from clients if not in metrics
+        malicious_ids = set(self.committee_metrics.get('actual_malicious', []))
+        if not malicious_ids:
+            # Fallback: extract from clients directly
+            malicious_ids = set([c.client_id for c in self.clients if c.is_malicious])
+            print(f"[DEBUG] Extracted {len(malicious_ids)} malicious IDs from clients directly")
+
+        num_malicious = len(malicious_ids)
+        num_benign = len(self.clients) - num_malicious
+
+        # Count total detections across all rounds
+        total_detected_malicious = 0
+        total_false_positives = 0
+
+        for round_info in self.round_history:
+            detected_set = set(round_info.get('anomalous_clients', []))
+            total_detected_malicious += len(detected_set & malicious_ids)
+            total_false_positives += len(detected_set - malicious_ids)
+
+        # Compute confusion matrix elements
+        true_positives = total_detected_malicious  # Malicious correctly identified
+        false_positives = total_false_positives    # Benign incorrectly identified as malicious
+        false_negatives = num_malicious - true_positives  # Malicious missed
+        true_negatives = num_benign - false_positives     # Benign correctly identified
+
+        # Compute rates
+        detection_rate = (true_positives / num_malicious * 100) if num_malicious > 0 else 0.0
+        false_positive_rate = (false_positives / num_benign * 100) if num_benign > 0 else 0.0
+        false_negative_rate = (false_negatives / num_malicious * 100) if num_malicious > 0 else 0.0
+
+        # Compute precision and recall
+        # Precision: Of all detected malicious, how many were actually malicious? (TP / (TP + FP))
+        precision = (true_positives / (true_positives + false_positives) * 100) if (true_positives + false_positives) > 0 else 0.0
+
+        # Recall: Of all actual malicious, how many were detected? (TP / (TP + FN)) - same as detection_rate
+        recall = detection_rate  # Recall = TP / (TP + FN) = detection_rate
+
         return {
-            'detection_rate': self.committee_metrics['detection_rate'],
-            'false_positive_rate': self.committee_metrics['false_positive_rate'],
-            'actual_malicious': self.committee_metrics['actual_malicious'],
-            'total_clients': len(self.clients)
+            'detection_rate': detection_rate,
+            'false_positive_rate': false_positive_rate,
+            'false_negative_rate': false_negative_rate,
+            'precision': precision,
+            'recall': recall,
+            'true_positives': true_positives,
+            'true_negatives': true_negatives,
+            'false_positives': false_positives,
+            'false_negatives': false_negatives,
+            'detected_malicious': total_detected_malicious,
+            'actual_malicious': list(malicious_ids),
+            'total_clients': len(self.clients),
+            'num_malicious': num_malicious,
+            'num_benign': num_benign
         }
 
     def evaluate_on_test_set(self, test_loader):
@@ -513,5 +609,5 @@ class DecentralizedFLCoordinator:
             'client_accuracies': client_accuracies,
             'attack_success_rates': asr_rates,
             'avg_attack_success': avg_asr,
-            'committee_metrics': self.get_committee_metrics() if self.use_committee_defense else None
+            'committee_metrics': self.get_committee_metrics() if self.use_defense else None
         }
