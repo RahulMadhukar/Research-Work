@@ -426,9 +426,9 @@ class PlottingEngine:
                 # Compute from predictions if available
                 true_labels = scenario_data.get('true_client_labels', [])
                 pred_labels = scenario_data.get('predicted_client_labels', [])
-                
+
                 if not true_labels or not pred_labels:
-                    print(f"[WARN] No client labels found for confusion matrix")
+                    # Silently skip if client labels not available (common for aggregated results)
                     return
                 
                 true_labels = np.array(true_labels)
@@ -1230,7 +1230,9 @@ class PlottingEngine:
     def plot_defense_effectiveness(self, results):
         """Plot Defense Recovery Rate (%) for each attack type across all datasets and committee-based defenses."""
         attack_list = ['slf', 'dlf', 'centralized', 'coordinated', 'random', 'model_dependent',
-                       'local_model_replacement', 'local_model_noise', 'global_model_replacement', 'aggregation_modification']
+                       # Model poisoning attacks — commented out (redundant; uncomment if needed)
+                       # 'local_model_replacement', 'local_model_noise', 'global_model_replacement', 'aggregation_modification',
+                       ]
         defense_types = ['adaptivecommittee', 'cmfl']
         defense_colors = {
             'adaptivecommittee': '#4169E1',  # Royal Blue

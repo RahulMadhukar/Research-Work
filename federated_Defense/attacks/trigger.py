@@ -3,7 +3,12 @@ import numpy as np
 import torch.nn as nn
 import torch
 import torch.optim as optim
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Union
+
+
+def _is_text_data(shape: Tuple[int, ...]) -> bool:
+    """1D data = text sequence (Shakespeare / Sentiment140), 2D/3D = image."""
+    return len(shape) == 1
 
 
 # ==================================================================
@@ -159,6 +164,59 @@ class TriggerGenerator:
         return base
 
     # ==============================
+    # TEXT (1-D) TRIGGER UTILITIES
+    # ==============================
+    @staticmethod
+    def text_trigger(seq_len: int, trigger_size: int = 4,
+                     position: str = 'end',
+                     seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate trigger tokens for a 1-D text sequence.
+
+        Args:
+            seq_len:      Length of the input sequence (e.g. 80 for Shakespeare).
+            trigger_size: Number of tokens to replace (capped at seq_len // 5).
+            position:     'end' (default), 'start', or 'random'.
+            seed:         Deterministic seed for reproducibility.
+
+        Returns:
+            (positions, values) — both int64 numpy arrays.
+            ``positions`` are indices into the sequence; ``values`` are the
+            replacement token ids (rare / high-index tokens).
+        """
+        trigger_size = max(1, min(trigger_size, max(1, seq_len // 5)))
+
+        rng = np.random.RandomState(seed if seed is not None else 42)
+
+        # --- positions ---
+        if position == 'start':
+            positions = np.arange(trigger_size, dtype=np.int64)
+        elif position == 'random':
+            positions = rng.choice(seq_len, size=trigger_size, replace=False).astype(np.int64)
+            positions.sort()
+        else:  # 'end' (default)
+            positions = np.arange(seq_len - trigger_size, seq_len, dtype=np.int64)
+
+        # --- values: rare high-index tokens, deterministic from seed ---
+        # Shakespeare vocab 0-79, Sentiment140 vocab 0-~30000.
+        # We pick from the top 10 % of the index range so the tokens are rare.
+        low = max(1, int(seq_len * 0.9))
+        high = max(low + 1, seq_len)
+        values = rng.randint(low, high, size=trigger_size).astype(np.int64)
+
+        return positions, values
+
+    @staticmethod
+    def apply_text_trigger(x: np.ndarray,
+                           positions: np.ndarray,
+                           values: np.ndarray) -> np.ndarray:
+        """Replace tokens at *positions* with *values* in a 1-D sequence ``x``."""
+        x_out = x.copy()
+        for pos, val in zip(positions, values):
+            if 0 <= pos < len(x_out):
+                x_out[pos] = val
+        return x_out
+
+    # ==============================
     # ALIGN TRIGGER WITH GRADIENT
     # ==============================
     @staticmethod
@@ -241,20 +299,26 @@ class CentralizedTriggerAttack(BaseAttack):
         else:
             self.target_class = config.target_class
 
-    def generate_trigger(self, data_shape: Tuple[int, ...]) -> np.ndarray:
-        """Generate fixed combined base trigger for centralized coordination"""
+    def generate_trigger(self, data_shape: Tuple[int, ...]):
+        """Generate fixed combined base trigger for centralized coordination.
+        Returns (positions, values) tuple for text data, np.ndarray for images."""
+        if _is_text_data(data_shape):
+            return TriggerGenerator.text_trigger(data_shape[0], seed=42)
         # Use FIXED seed=42 so all clients generate identical triggers
         base = TriggerGenerator.combine_triggers(data_shape,
                                                  intensity=0.9,
                                                  seed=42)  # Fixed seed for centralized attack
         return base
 
-    def apply_trigger(self, x: np.ndarray, trigger: Optional[np.ndarray] = None) -> np.ndarray:
-        """Apply trigger to input sample"""
+    def apply_trigger(self, x: np.ndarray, trigger=None) -> np.ndarray:
+        """Apply trigger to input sample. Trigger is (positions, values) for text, ndarray for images."""
         if trigger is None:
             if self.trigger_pattern is None:
                 self.trigger_pattern = self.generate_trigger(x.shape)
             trigger = self.trigger_pattern
+        if isinstance(trigger, tuple):
+            positions, values = trigger
+            return TriggerGenerator.apply_text_trigger(x, positions, values)
         triggered_x = x + trigger
         return np.clip(triggered_x, 0.0, 1.0)
 
@@ -275,8 +339,8 @@ class CentralizedTriggerAttack(BaseAttack):
             print(f"  [Centralized] Client {client_id}: No source class samples found")
             return X_poisoned, y_poisoned, np.zeros(len(X), dtype=bool)
 
-        # Apply poisoning_rate to SOURCE class samples only
-        n_poison = int(self.config.poisoning_rate * len(source_indices))
+        # Apply data_poisoning_rate to SOURCE class samples only
+        n_poison = int(self.config.data_poisoning_rate * len(source_indices))
         if n_poison <= 0:
             poison_indices = []
         else:
@@ -284,20 +348,24 @@ class CentralizedTriggerAttack(BaseAttack):
 
         # FIXED: Generate a SINGLE consistent trigger pattern for all poisoned samples
         # For Centralized attack, ALL clients must use the SAME trigger (fixed seed)
+        text_mode = _is_text_data(X[0].shape)
         if len(poison_indices) > 0:
             if self.trigger_pattern is None:
-                # Generate base trigger once and store it
-                # Use FIXED seed=42 so all clients generate identical triggers
-                self.trigger_pattern = TriggerGenerator.combine_triggers(
-                    X[0].shape,
-                    intensity=0.9,
-                    seed=42  # FIXED seed for centralized coordination
-                )
+                if text_mode:
+                    self.trigger_pattern = TriggerGenerator.text_trigger(
+                        X[0].shape[0], seed=42)
+                else:
+                    self.trigger_pattern = TriggerGenerator.combine_triggers(
+                        X[0].shape,
+                        intensity=0.9,
+                        seed=42  # FIXED seed for centralized coordination
+                    )
 
         # Apply the SAME trigger to all poisoned samples
         for idx in poison_indices:
-            if model is not None:
+            if model is not None and not text_mode:
                 # Optimize the consistent trigger for better effectiveness
+                # (gradient optimization is skipped for text — discrete tokens)
                 optimized = TriggerGenerator.align_trigger_with_gradient(
                     model, X[idx], self.target_class,
                     base_trigger=self.trigger_pattern,  # Use consistent trigger
@@ -325,23 +393,21 @@ class CentralizedTriggerAttack(BaseAttack):
         model.eval()
 
         # FIXED: Only evaluate on non-target samples (standard backdoor ASR definition)
-        # Exclude samples already labeled as target_class to measure true misclassification
         non_target_mask = (y_test != self.target_class)
         if not np.any(non_target_mask):
-            return 0.0  # No non-target samples to evaluate
+            return 0.0
 
         X_non_target = X_test[non_target_mask]
 
         # Apply trigger to non-target samples
-        base_trigger = self.trigger_pattern if self.trigger_pattern is not None else self.generate_trigger(X_non_target[0].shape)
-        X_triggered = np.array([self.apply_trigger(x, base_trigger) for x in X_non_target])
+        trigger = self.trigger_pattern if self.trigger_pattern is not None else self.generate_trigger(X_non_target[0].shape)
+        X_triggered = np.array([self.apply_trigger(x, trigger) for x in X_non_target])
 
         X_tensor = torch.FloatTensor(X_triggered).to(device)
         with torch.no_grad():
             outputs = model(X_tensor)
             y_pred = torch.argmax(outputs, dim=1)
 
-        # ASR = proportion of non-target samples misclassified as target after trigger
         success_mask = (y_pred.cpu() == self.target_class)
         asr = success_mask.float().mean().item()
         return asr
@@ -360,7 +426,7 @@ class CoordinatedTriggerAttack(BaseAttack):
 
     def __init__(self, config: AttackConfig):
         super().__init__(config)
-        self.client_triggers: Dict[int, np.ndarray] = {}
+        self.client_triggers: Dict[int, object] = {}  # ndarray (image) or tuple (text)
 
         # FIXED: Support multiple source classes
         if config.source_class is not None:
@@ -377,34 +443,42 @@ class CoordinatedTriggerAttack(BaseAttack):
         else:
             self.target_class = config.target_class
 
-    def generate_client_trigger(self, client_id: int, data_shape: Tuple[int, ...]) -> np.ndarray:
-        """Generate per-client combined trigger"""
-        # CHANGED: very high intensity for aggressive attacks
+    def generate_client_trigger(self, client_id: int, data_shape: Tuple[int, ...]):
+        """Generate per-client trigger. Returns tuple for text, ndarray for images."""
+        if _is_text_data(data_shape):
+            return TriggerGenerator.text_trigger(data_shape[0], seed=client_id + 1000)
         base = TriggerGenerator.combine_triggers(data_shape,
-                                                 intensity=0.85,  # CHANGED: very high intensity
+                                                 intensity=0.85,
                                                  seed=client_id + 1000)
         return base
 
     def get_client_trigger(self, client_id: int, data_shape: Tuple[int, ...],
-                          model: Optional[nn.Module] = None) -> np.ndarray:
+                          model: Optional[nn.Module] = None):
         """Get or create optimized trigger for specific client"""
         if client_id not in self.client_triggers:
             base = self.generate_client_trigger(client_id, data_shape)
-            if model is not None:
+            if isinstance(base, tuple):
+                # Text trigger — no gradient optimization for discrete tokens
+                self.client_triggers[client_id] = base
+            elif model is not None:
                 representative_dummy = np.zeros(data_shape, dtype=np.float32)
                 optimized = TriggerGenerator.align_trigger_with_gradient(
                     model, representative_dummy, self.target_class,
                     base_trigger=base,
-                    optimization_steps=75,  # CHANGED: more optimization
-                    lr=0.25,  # CHANGED: higher lr
-                    epsilon=0.65  # CHANGED: larger budget
+                    optimization_steps=75,
+                    lr=0.25,
+                    epsilon=0.65
                 )
                 self.client_triggers[client_id] = optimized
             else:
                 self.client_triggers[client_id] = base
         return self.client_triggers[client_id]
 
-    def apply_trigger(self, x: np.ndarray, trigger: np.ndarray) -> np.ndarray:
+    def apply_trigger(self, x: np.ndarray, trigger) -> np.ndarray:
+        """Apply trigger. Trigger is (positions, values) for text, ndarray for images."""
+        if isinstance(trigger, tuple):
+            positions, values = trigger
+            return TriggerGenerator.apply_text_trigger(x, positions, values)
         triggered_x = x + trigger
         return np.clip(triggered_x, 0.0, 1.0)
 
@@ -425,8 +499,8 @@ class CoordinatedTriggerAttack(BaseAttack):
         data_shape = X[0].shape if len(X) > 0 else X.shape[1:]
         client_trigger = self.get_client_trigger(client_id, data_shape, model=model)
 
-        # Apply poisoning_rate to SOURCE class samples only
-        n_poison = int(self.config.poisoning_rate * len(source_indices))
+        # Apply data_poisoning_rate to SOURCE class samples only
+        n_poison = int(self.config.data_poisoning_rate * len(source_indices))
         if n_poison <= 0:
             poison_indices = []
         else:
@@ -505,16 +579,23 @@ class RandomTriggerAttack(BaseAttack):
         self.trigger_history = []
 
     def generate_random_trigger(self, data_shape: Tuple[int, ...],
-                                seed: Optional[int] = None) -> np.ndarray:
-        """Generate random combined trigger"""
-        # CHANGED: very high intensity for aggressive attacks
+                                seed: Optional[int] = None):
+        """Generate random trigger. Returns tuple for text, ndarray for images."""
+        if _is_text_data(data_shape):
+            trig = TriggerGenerator.text_trigger(data_shape[0], seed=seed)
+            self.trigger_history.append(trig)
+            return trig
         trigger = TriggerGenerator.combine_triggers(data_shape,
-                                                    intensity=0.85,  # CHANGED: very high intensity
+                                                    intensity=0.85,
                                                     seed=seed)
         self.trigger_history.append(trigger.copy())
         return trigger
 
-    def apply_trigger(self, x: np.ndarray, trigger: np.ndarray) -> np.ndarray:
+    def apply_trigger(self, x: np.ndarray, trigger) -> np.ndarray:
+        """Apply trigger. Trigger is (positions, values) for text, ndarray for images."""
+        if isinstance(trigger, tuple):
+            positions, values = trigger
+            return TriggerGenerator.apply_text_trigger(x, positions, values)
         triggered_x = x + trigger
         return np.clip(triggered_x, 0.0, 1.0)
 
@@ -532,23 +613,25 @@ class RandomTriggerAttack(BaseAttack):
             print(f"  [Random] Client {client_id}: No source class samples found")
             return X_poisoned, y_poisoned, np.zeros(len(X), dtype=bool)
 
-        # Apply poisoning_rate to SOURCE class samples only
-        n_poison = int(self.config.poisoning_rate * len(source_indices))
+        # Apply data_poisoning_rate to SOURCE class samples only
+        n_poison = int(self.config.data_poisoning_rate * len(source_indices))
         if n_poison <= 0:
             poison_indices = []
         else:
             poison_indices = np.random.choice(source_indices, n_poison, replace=False)
 
+        text_mode = _is_text_data(X[0].shape)
         for i, idx in enumerate(poison_indices):
             seed = client_id * 10000 + idx + i
             base = self.generate_random_trigger(X[idx].shape, seed=seed)
-            if model is not None:
+            if model is not None and not text_mode:
+                # Gradient optimization is skipped for text (discrete tokens)
                 optimized = TriggerGenerator.align_trigger_with_gradient(
                     model, X[idx], self.target_class,
                     base_trigger=base,
-                    optimization_steps=75,  # CHANGED: more optimization
-                    lr=0.25,  # CHANGED: higher lr
-                    epsilon=0.65  # CHANGED: larger budget
+                    optimization_steps=75,
+                    lr=0.25,
+                    epsilon=0.65
                 )
                 X_poisoned[idx] = np.clip(X[idx] + optimized, 0.0, 1.0)
             else:
@@ -645,17 +728,20 @@ class ModelDependentTriggerAttack(BaseAttack):
 
     def optimize_trigger(self, model: nn.Module, sample: np.ndarray,
                          target_centroid: torch.Tensor,
-                         optimization_steps: int = 75) -> np.ndarray:
-        """Optimize combined base trigger with very high intensity"""
+                         optimization_steps: int = 75):
+        """Generate/optimize trigger. Returns (positions, values) for text, ndarray for images."""
+        if _is_text_data(sample.shape):
+            # Text data: discrete tokens, no gradient optimization possible
+            return TriggerGenerator.text_trigger(sample.shape[0], seed=42)
         base = TriggerGenerator.combine_triggers(sample.shape,
-                                                 intensity=0.9,  # CHANGED: very high intensity
+                                                 intensity=0.9,
                                                  seed=None)
         optimized = TriggerGenerator.align_trigger_with_gradient(
             model, sample, self.target_class,
             base_trigger=base,
             optimization_steps=optimization_steps,
-            lr=0.3,  # CHANGED: higher learning rate
-            epsilon=0.7  # CHANGED: larger perturbation budget
+            lr=0.3,
+            epsilon=0.7
         )
         return optimized
 
@@ -684,11 +770,11 @@ class ModelDependentTriggerAttack(BaseAttack):
             print(f"  [ModelDep] Warning: No source class {self.source_class} samples in client {client_id}")
             return X_poisoned, y_poisoned, np.zeros(len(X), dtype=bool)
 
-        # Apply poisoning_rate to SOURCE class samples only
-        n_poison = int(self.config.poisoning_rate * len(source_indices))
+        # Apply data_poisoning_rate to SOURCE class samples only
+        n_poison = int(self.config.data_poisoning_rate * len(source_indices))
 
         if n_poison <= 0:
-            print(f"  [ModelDep] Warning: No samples to poison (poisoning_rate={self.config.poisoning_rate})")
+            print(f"  [ModelDep] Warning: No samples to poison (data_poisoning_rate={self.config.data_poisoning_rate})")
             return X_poisoned, y_poisoned, np.zeros(len(X), dtype=bool)
 
         # Select subset of source class samples to poison
@@ -711,7 +797,11 @@ class ModelDependentTriggerAttack(BaseAttack):
         # Apply the SAME optimized trigger to ALL poisoned samples
         shared_trigger = self.optimized_triggers[client_key]
         for idx in poison_indices:
-            X_poisoned[idx] = np.clip(X[idx] + shared_trigger, 0.0, 1.0)
+            if isinstance(shared_trigger, tuple):
+                positions, values = shared_trigger
+                X_poisoned[idx] = TriggerGenerator.apply_text_trigger(X[idx], positions, values)
+            else:
+                X_poisoned[idx] = np.clip(X[idx] + shared_trigger, 0.0, 1.0)
             y_poisoned[idx] = self.target_class
 
         poison_mask = np.zeros(len(X), dtype=bool)
@@ -756,7 +846,11 @@ class ModelDependentTriggerAttack(BaseAttack):
             )
 
         # Apply the SAME trigger to all test samples
-        X_triggered = np.array([np.clip(sample + shared_trigger, 0.0, 1.0) for sample in test_samples])
+        if isinstance(shared_trigger, tuple):
+            positions, values = shared_trigger
+            X_triggered = np.array([TriggerGenerator.apply_text_trigger(s, positions, values) for s in test_samples])
+        else:
+            X_triggered = np.array([np.clip(sample + shared_trigger, 0.0, 1.0) for sample in test_samples])
         X_tensor = torch.FloatTensor(X_triggered).to(device)
 
         with torch.no_grad():

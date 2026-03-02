@@ -1,9 +1,8 @@
-# FIX: Set thread limits BEFORE importing numpy/torch to prevent OpenBLAS warnings
+# Allow multi-threaded CPU operations for proper GPU utilization.
+# Setting these to '1' previously forced ALL CPU ops (data loading, tensor creation,
+# numpy defense computations) to be single-threaded, starving the GPU of data
+# and making H100 run at CPU speed.
 import os
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
-os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
 import argparse
 from evaluation import run_enhanced_evaluation, run_attack_comparison_test, run_comprehensive_defense_test
@@ -29,7 +28,7 @@ if __name__ == "__main__":
                         help="Defense types to test (standard mode - both committee-based)")
     parser.add_argument("--subset", type=float, default=0.25,
                         help="Dataset subset fraction (0.1 = 10%%)")
-    parser.add_argument("--clients", type=int, default=10,
+    parser.add_argument("--clients", type=int, default=25,
                         help="Number of clients (comprehensive mode)")
     parser.add_argument("--rounds", type=int, default=20,
                         help="Number of FL rounds (comprehensive mode)")
@@ -68,10 +67,12 @@ if __name__ == "__main__":
         print(f"  ✓ Random Backdoor")
         print(f"  ✓ Model-Dependent Attack")
         print(f"\nFor all 4 datasets:")
-        print(f"  ✓ MNIST")
+        print(f"  ✓ FEMNIST")
         print(f"  ✓ Fashion-MNIST")
         print(f"  ✓ EMNIST")
         print(f"  ✓ CIFAR-10")
+        print(f"  ✓ Shakespeare")
+        print(f"  ✓ Sentiment140")
         print("="*100)
 
         try:

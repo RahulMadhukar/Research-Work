@@ -34,6 +34,8 @@ class LocalModelReplacementAttack(BaseAttack):
 
     Note: Uses ADDITIVE perturbations for realistic FL attack (10-20% impact)
     """
+    POISONS_DATA  = False   # poison_dataset only sets a tracking mask; data unchanged
+    POISONS_MODEL = True    # real attack in poison_model()
 
     def __init__(self, config: AttackConfig):
         super().__init__(config)
@@ -48,7 +50,7 @@ class LocalModelReplacementAttack(BaseAttack):
         """
         # Create poison mask (mark all samples as poisoned for tracking)
         n_samples = len(y)
-        n_poison = int(n_samples * self.config.poisoning_rate)
+        n_poison = int(n_samples * self.config.data_poisoning_rate)
 
         self.poison_mask = np.zeros(n_samples, dtype=bool)
         poison_indices = np.random.choice(n_samples, n_poison, replace=False)
@@ -119,6 +121,8 @@ class LocalModelNoiseAttack(BaseAttack):
 
     This attack is more subtle than full replacement and harder to detect.
     """
+    POISONS_DATA  = False   # poison_dataset only sets a tracking mask; data unchanged
+    POISONS_MODEL = True    # real attack in poison_model()
 
     def __init__(self, config: AttackConfig):
         super().__init__(config)
@@ -131,7 +135,7 @@ class LocalModelNoiseAttack(BaseAttack):
         For noise-based model poisoning, we don't modify the dataset.
         """
         n_samples = len(y)
-        n_poison = int(n_samples * self.config.poisoning_rate)
+        n_poison = int(n_samples * self.config.data_poisoning_rate)
 
         self.poison_mask = np.zeros(n_samples, dtype=bool)
         poison_indices = np.random.choice(n_samples, n_poison, replace=False)
@@ -205,6 +209,8 @@ class GlobalModelReplacementAttack(BaseAttack):
 
     Note: Relies on data poisoning alone for 15-30% accuracy impact
     """
+    POISONS_DATA  = True    # flips labels in poison_dataset()
+    POISONS_MODEL = False   # poison_model() is a documented no-op
 
     def __init__(self, config: AttackConfig):
         super().__init__(config)
@@ -216,7 +222,7 @@ class GlobalModelReplacementAttack(BaseAttack):
         Poison a subset of the training data with target labels.
         """
         n_samples = len(y)
-        n_poison = int(n_samples * self.config.poisoning_rate)
+        n_poison = int(n_samples * self.config.data_poisoning_rate)
 
         self.poison_mask = np.zeros(n_samples, dtype=bool)
 
@@ -293,6 +299,8 @@ class AggregationModificationAttack(BaseAttack):
     Note: This attack requires coordination at the aggregation level,
     so it works in conjunction with model poisoning.
     """
+    POISONS_DATA  = True    # flips labels in poison_dataset()
+    POISONS_MODEL = True    # manipulate_update() perturbs the submitted update
 
     def __init__(self, config: AttackConfig):
         super().__init__(config)
@@ -305,7 +313,7 @@ class AggregationModificationAttack(BaseAttack):
         Poison training data for aggregation manipulation.
         """
         n_samples = len(y)
-        n_poison = int(n_samples * self.config.poisoning_rate)
+        n_poison = int(n_samples * self.config.data_poisoning_rate)
 
         self.poison_mask = np.zeros(n_samples, dtype=bool)
 

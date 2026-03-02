@@ -24,7 +24,7 @@ def attack_summary(results: Dict[str, Dict[str, Any]], save_dir="results") -> No
         summary_data[attack_name] = {
             "attack_type": metrics.get("attack_type", "N/A"),
             "target_classes": metrics.get("target_classes", "N/A"),
-            "poisoning_rate": metrics.get("poisoning_rate", 0),
+            "data_poisoning_rate": metrics.get("data_poisoning_rate", 0),
             "ASR": metrics.get("ASR", 0),
             "model_accuracy": metrics.get("model_accuracy", 0),
             "defense_success": metrics.get("defense_success", 0),
@@ -40,7 +40,7 @@ def attack_summary(results: Dict[str, Dict[str, Any]], save_dir="results") -> No
     # Save CSV
     with open(csv_file, "w", newline="") as f:
         writer = csv.writer(f)
-        headers = ["attack_name", "attack_type", "target_classes", "poisoning_rate",
+        headers = ["attack_name", "attack_type", "target_classes", "data_poisoning_rate",
                    "ASR", "model_accuracy", "defense_success", "detection_rate", "false_positive_rate"]
         writer.writerow(headers)
         for attack_name, metrics in summary_data.items():
@@ -48,7 +48,7 @@ def attack_summary(results: Dict[str, Dict[str, Any]], save_dir="results") -> No
                 attack_name,
                 metrics["attack_type"],
                 metrics["target_classes"],
-                metrics["poisoning_rate"],
+                metrics["data_poisoning_rate"],
                 metrics["ASR"],
                 metrics["model_accuracy"],
                 metrics["defense_success"],

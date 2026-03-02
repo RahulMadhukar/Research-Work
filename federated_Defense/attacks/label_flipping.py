@@ -135,11 +135,8 @@ class StaticLabelFlipping(BaseAttack):
                 print(f"  [SLF] No samples of class {source_class} in client {client_id}")
                 continue
 
-            # FIXED: Poison X% of EACH source class (not divided by number of classes)
-            # This makes the attack much more aggressive
-            #n_poison = int(self.config.poisoning_rate * len(source_indices))
-
-            n_poison = int(self.config.poisoning_rate * total_samples / len(self.source_classes))
+            # Poison X% of EACH source class (not divided by number of classes)
+            n_poison = int(self.config.data_poisoning_rate * total_samples / len(self.source_classes))
             n_poison = min(n_poison, len(source_indices))
 
             # Choose strategy: 'random', 'feature', 'loss'
@@ -435,7 +432,7 @@ class DynamicLabelFlipping(BaseAttack):
 
         for source_class, target_class in self.target_mapping.items():
             source_indices = np.where(y == source_class)[0]
-            n_poison = int(self.config.poisoning_rate * len(source_indices))
+            n_poison = int(self.config.data_poisoning_rate * len(source_indices))
 
             if n_poison <= 0:
                 continue

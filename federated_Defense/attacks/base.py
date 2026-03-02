@@ -7,13 +7,13 @@ from typing import Optional, Dict, Tuple
 
 @dataclass
 class AttackConfig:
-    def __init__(self, attack_type, poisoning_rate=0.0, poison_percentage=None, source_class=None, target_class=None,
+    def __init__(self, attack_type, data_poisoning_rate=0.0, poison_percentage=None, source_class=None, target_class=None,
                  num_malicious_clients=1, trigger_size=None, trigger_intensity=None, epsilon=None):
         self.attack_type = attack_type
         # poison_percentage: percentage of data to poison (20%, 40%, 60%, 80%)
-        # poisoning_rate: kept for backwards compatibility (same as poison_percentage)
-        self.poison_percentage = poison_percentage if poison_percentage is not None else poisoning_rate
-        self.poisoning_rate = self.poison_percentage  # For backwards compatibility
+        # data_poisoning_rate: how much of each malicious client's data is poisoned
+        self.poison_percentage = poison_percentage if poison_percentage is not None else data_poisoning_rate
+        self.data_poisoning_rate = self.poison_percentage
         self.source_class = source_class
         self.target_class = target_class
         self.num_malicious_clients = num_malicious_clients
@@ -22,6 +22,14 @@ class AttackConfig:
         self.epsilon = epsilon
 
 class BaseAttack(ABC):
+    # --- attack-type flags (override in subclasses) ---
+    # True  → poison_dataset() actually modifies labels / injects triggers.
+    # False → poison_dataset() is a no-op (possibly used for bookkeeping only).
+    POISONS_DATA = True
+    # True  → poison_model() (or manipulate_update()) is the real attack step.
+    # False → model-level call is unnecessary or a no-op.
+    POISONS_MODEL = False
+
     def __init__(self, config: AttackConfig):
         self.config = config
 
@@ -33,12 +41,8 @@ class BaseAttack(ABC):
         """Generic summary for all attacks"""
         return {
             "attack_type": self.__class__.__name__,
-            "poisoning_rate": getattr(self.config, "poisoning_rate", None),
+            "data_poisoning_rate": getattr(self.config, "data_poisoning_rate", None),
         }
-
-    @abstractmethod
-    def evaluate_attack_success(self, model: nn.Module, X_test: np.ndarray, y_test: np.ndarray) -> float:
-        pass
 
     def compute_asr(self,
                     y_true: torch.Tensor,

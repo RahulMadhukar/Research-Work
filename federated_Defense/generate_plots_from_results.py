@@ -16,12 +16,9 @@ Usage:
     python generate_plots_from_results.py --results-dir Output/20250104_120000/results --run-id custom_run
 """
 
-# FIX: Set thread limits BEFORE importing numpy/torch to prevent OpenBLAS warnings
+# Thread settings removed: setting to '1' serializes numpy/sklearn ops,
+# killing multi-core parallelism and hurting performance by 20-40%.
 import os
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
-os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
 import sys
 import json
