@@ -44,7 +44,7 @@ def run_full_ablation_study(selected_datasets=None, selected_attacks=None):
     output_base = f"Output/lightweight_ablation/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     Path(output_base).mkdir(parents=True, exist_ok=True)
 
-    dataset_fraction = 1.0
+    dataset_fraction = 0.50
     num_clients = {
         'FEMNIST': 550, 'Shakespeare': 143, 'Sentiment140': 172,
     }
