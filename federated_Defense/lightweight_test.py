@@ -44,15 +44,30 @@ def run_full_ablation_study(selected_datasets=None, selected_attacks=None):
     output_base = f"Output/lightweight_ablation/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     Path(output_base).mkdir(parents=True, exist_ok=True)
 
-    dataset_fraction = 0.50
+    dataset_fraction = 0.5
     num_clients = {
-        'FEMNIST': 550, 'Shakespeare': 143, 'Sentiment140': 172,
+        'FEMNIST': 100, 'Shakespeare': 100, 'Sentiment140': 100,
     }
     dataset_rounds = {
-        'FEMNIST': 600, 'Shakespeare': 500, 'Sentiment140': 1000,
+        'FEMNIST': 200, 'Shakespeare': 150, 'Sentiment140': 300,
     }
     all_attacks = attacks_to_run
     all_schemes = ['fedavg', 'multi_krum', 'cmfl', 'cmfl_ii']
+
+    # Print experiment configuration
+    from run_impact_analysis import DATASET_LR, DATASET_BATCH_SIZE
+    print("\n" + "="*100)
+    print("LIGHTWEIGHT ABLATION STUDY — CONFIGURATION")
+    print("="*100)
+    print(f"Datasets             : {datasets_order}")
+    print(f"Attacks              : {attacks_to_run}")
+    print(f"Schemes              : {all_schemes}")
+    print(f"Dataset fraction     : {dataset_fraction}")
+    print(f"Total clients        : {num_clients}")
+    print(f"Rounds per dataset   : {dataset_rounds}")
+    print(f"Learning rate        : {DATASET_LR}")
+    print(f"Batch size           : {DATASET_BATCH_SIZE}")
+    print("="*100)
 
     all_results = {
         'client_malicious_ratio': {},
@@ -61,10 +76,10 @@ def run_full_ablation_study(selected_datasets=None, selected_attacks=None):
     }
 
     for ds in datasets_order:
-        print(f"\n[DATASET] {ds} (rounds={dataset_rounds[ds]}, fraction={dataset_fraction})")
+        clients_per_round = max(1, int(num_clients[ds] * 0.1))
+        print(f"\n[DATASET] {ds} (clients={num_clients[ds]}, active={clients_per_round}, rounds={dataset_rounds[ds]}, fraction={dataset_fraction}, lr={DATASET_LR.get(ds, 0.001)}, batch_size={DATASET_BATCH_SIZE.get(ds, 32)})")
 
         ds_list = [ds]
-        clients_per_round = max(1, int(num_clients[ds] * 0.1))
 
         # 1. Client Malicious Ratio (Section 6.3/6.4)
         try:

@@ -49,6 +49,21 @@ def run_full_ablation_study(selected_datasets=None, selected_attacks=None):
         'cmfl', 'cmfl_ii',
     ]
 
+    # Print experiment configuration
+    from run_impact_analysis import DATASET_LR, DATASET_BATCH_SIZE
+    print("\n" + "="*100)
+    print("QUICK ABLATION STUDY — CONFIGURATION")
+    print("="*100)
+    print(f"Datasets             : {datasets}")
+    print(f"Attacks              : {attacks_to_run}")
+    print(f"Schemes              : {all_schemes}")
+    print(f"Dataset fraction     : {dataset_fraction}")
+    print(f"Total clients        : {num_clients}")
+    print(f"Rounds               : {rounds}")
+    print(f"Learning rate        : {DATASET_LR}")
+    print(f"Batch size           : {DATASET_BATCH_SIZE}")
+    print("="*100)
+
     all_results = {
         'client_malicious_ratio': {},
         'agg_participation':      {},
@@ -56,10 +71,10 @@ def run_full_ablation_study(selected_datasets=None, selected_attacks=None):
     }
 
     for ds in datasets:
-        print(f"\n[DATASET] {ds} (clients={num_clients[ds]}, rounds={rounds}, fraction={dataset_fraction})")
+        clients_per_round = max(1, int(num_clients[ds] * 0.1))
+        print(f"\n[DATASET] {ds} (clients={num_clients[ds]}, active={clients_per_round}, rounds={rounds}, fraction={dataset_fraction}, lr={DATASET_LR.get(ds, 0.001)}, batch_size={DATASET_BATCH_SIZE.get(ds, 32)})")
 
         ds_list = [ds]
-        clients_per_round = max(1, int(num_clients[ds] * 0.1))
 
         # 1. Client Malicious Ratio (Section 6.3/6.4)
         try:
