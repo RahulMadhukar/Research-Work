@@ -46,7 +46,7 @@ def run_full_ablation_study(selected_datasets=None, selected_attacks=None):
 
     dataset_fraction = 1.0
     num_clients = {
-        'FEMNIST': 3550, 'Shakespeare': 143, 'Sentiment140': 172,
+        'FEMNIST': 550, 'Shakespeare': 143, 'Sentiment140': 172,
     }
     dataset_rounds = {
         'FEMNIST': 600, 'Shakespeare': 500, 'Sentiment140': 1000,
