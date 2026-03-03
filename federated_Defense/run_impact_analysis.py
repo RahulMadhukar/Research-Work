@@ -86,7 +86,8 @@ def run_baseline_evaluation(
     aggregation_participation_frac: float = None,
     committee_size_frac: float = 0.40,
     scoring_mode: str = 'distance_only',
-    selection_strategy: int = 1
+    selection_strategy: int = 1,
+    lr: float = None
 ):
     """
     Run baseline evaluation with clean data (NO attack, NO poisoning).
@@ -102,7 +103,7 @@ def run_baseline_evaluation(
         aggregation: Aggregation method
         alpha: Dirichlet alpha for Non-IID data
         dataset_fraction: Fraction of dataset to use
-        scenario_name: Scenario name for checkpoint tracking
+        scenario_name: Scenario name for tracking
 
     Returns:
         float: Baseline accuracy (clean data, no attack)
@@ -110,14 +111,6 @@ def run_baseline_evaluation(
     import torch
     import math
     from coordinator import DecentralizedFLCoordinator
-
-    # Check for existing checkpoint and resume if available
-    checkpoint = framework.checkpoint_manager.load_checkpoint(
-        dataset=dataset_name,
-        attack='none',
-        scenario=scenario_name,
-        checkpoint_type='latest'
-    )
 
     # Get datasets and models
     datasets_and_loaders, models_map = framework.get_datasets_and_models(dataset_name)
@@ -162,15 +155,12 @@ def run_baseline_evaluation(
     # ---------------------------------------------------------------------------
     # Create coordinator — respects committee schemes even on clean (baseline) data
     # ---------------------------------------------------------------------------
-    _COMMITTEE_SCHEMES = {'cmfl', 'cmfl_ii'}  # Removed 'adaptivecommittee' — NOT in CMFL paper
+    _COMMITTEE_SCHEMES = {'cmfl', 'cmfl_ii'}
 
-    # Dataset-specific learning rates (paper-exact)
-    _DATASET_LR = {
-        'FEMNIST': 0.01,
-        'Sentiment140': 0.005,
-        'Shakespeare': 0.001,
-    }
-    lr = _DATASET_LR.get(dataset_name, 0.001)
+    # Dataset-specific learning rates and batch sizes
+    if lr is None:
+        lr = DATASET_LR.get(dataset_name, 0.001)
+    _bs = DATASET_BATCH_SIZE.get(dataset_name, 32)
 
     if aggregation.lower() in _COMMITTEE_SCHEMES:
         # cmfl_ii → cmfl defense with Selection Strategy II
@@ -195,10 +185,10 @@ def run_baseline_evaluation(
             aggregation_participation_frac=aggregation_participation_frac,
             scoring_mode=scoring_mode,
             selection_strategy=selection_strategy,
-            lr=lr
+            lr=lr, batch_size=_bs
         )
         strategy_label = "II" if selection_strategy == 2 else "I"
-        print(f"[INFO] Baseline ({chosen_defense.upper()}): committee={committee_size} ({committee_size_frac*100:.0f}%), training={training_clients}, Strategy {strategy_label}, detection=OFF (clean baseline), lr={lr}")
+        print(f"[INFO] Baseline ({chosen_defense.upper()}): committee={committee_size} ({committee_size_frac*100:.0f}%), training={training_clients}, Strategy {strategy_label}, detection=OFF (clean baseline), lr={lr}, batch_size={_bs}")
     else:
         coordinator = DecentralizedFLCoordinator(
             clients,
@@ -206,7 +196,7 @@ def run_baseline_evaluation(
             defense_type=None,
             aggregation_method=aggregation,
             clients_per_round=clients_per_round,
-            lr=lr
+            lr=lr, batch_size=_bs
         )
         print(f"[INFO] Baseline ({aggregation.upper()}): plain FL, {clients_per_round} clients/round")
 
@@ -420,7 +410,8 @@ def test_defense_on_scenario(
     committee_size_frac: float = 0.40,
     scoring_mode: str = 'distance_only',
     selection_strategy: int = 1,
-    lr: float = 0.01
+    lr: float = 0.01,
+    batch_size: int = 32
 ):
     """
     Run one FL scenario (baseline or attack) under a given aggregation scheme.
@@ -428,11 +419,8 @@ def test_defense_on_scenario(
     ``aggregation`` is the single knob that selects the method:
         'fedavg' | 'krum' | 'multi_krum' | 'median' | 'trimmed_mean'
             -> plain FL, no committee
-        'adaptivecommittee' | 'cmfl'
+        'cmfl' | 'cmfl_ii'
             -> committee-based FL (the scheme itself IS the defense)
-
-    ``defense_type`` is kept for back-compat but is ignored when
-    ``aggregation`` is already 'adaptivecommittee' or 'cmfl'.
 
     Deep-copies clients so the same poisoned set can be reused across schemes.
 
@@ -443,7 +431,7 @@ def test_defense_on_scenario(
     import math
     from coordinator import DecentralizedFLCoordinator
 
-    _COMMITTEE_SCHEMES = {'cmfl', 'cmfl_ii'}  # Removed 'adaptivecommittee' — NOT in CMFL paper
+    _COMMITTEE_SCHEMES = {'cmfl', 'cmfl_ii'}
 
     # Reset clients to their post-poisoning snapshot (no expensive deep copy)
     if hasattr(clients_list[0], '_snapshot_model_state'):
@@ -486,7 +474,7 @@ def test_defense_on_scenario(
             aggregation_participation_frac=aggregation_participation_frac,
             scoring_mode=scoring_mode,
             selection_strategy=selection_strategy,
-            lr=lr
+            lr=lr, batch_size=batch_size
         )
         strategy_label = "II" if selection_strategy == 2 else "I"
         print(f"[INFO] {chosen_defense.upper()} scheme: committee={committee_size or 'auto'} ({committee_size_frac*100:.0f}%), "
@@ -499,7 +487,7 @@ def test_defense_on_scenario(
             defense_type=None,
             aggregation_method=aggregation,
             clients_per_round=clients_per_round,
-            lr=lr
+            lr=lr, batch_size=batch_size
         )
         print(f"[INFO] {aggregation.upper()} scheme: plain FL, {clients_per_round or len(clients_copy)} clients/round")
 
@@ -629,9 +617,7 @@ def test_defense_on_scenario(
 # =============================================================================
 
 # Canonical list of aggregation schemes (plain + committee).
-# 'adaptivecommittee' removed — NOT in CMFL paper
 ALL_AGG_SCHEMES = ['fedavg', 'krum', 'multi_krum', 'median', 'trimmed_mean',
-                   # 'adaptivecommittee',  # NOT in CMFL paper
                    'cmfl', 'cmfl_ii']
 
 # ---------------------------------------------------------------------------
@@ -650,6 +636,11 @@ ALL_AGG_SCHEMES = ['fedavg', 'krum', 'multi_krum', 'median', 'trimmed_mean',
 DATA_POISONING_ATTACKS = []  # Empty — paper uses no data-poisoning attacks
 BYZANTINE_ATTACKS      = ['gradient_scaling', 'same_value', 'back_gradient']
 ALL_ATTACKS            = BYZANTINE_ATTACKS  # Paper: only Byzantine attacks
+
+# Paper-exact round counts per dataset (arXiv:2108.00365v2)
+DATASET_ROUNDS = {'FEMNIST': 600, 'Shakespeare': 500, 'Sentiment140': 1000}
+DATASET_LR = {'FEMNIST': 0.01, 'Sentiment140': 0.005, 'Shakespeare': 0.001}
+DATASET_BATCH_SIZE = {'FEMNIST': 32, 'Sentiment140': 32, 'Shakespeare': 32}
 
 
 def _run_baselines(
@@ -687,7 +678,8 @@ def _run_baselines(
                 aggregation_participation_frac=aggregation_participation_frac,
                 committee_size_frac=committee_size_frac,
                 scoring_mode=scoring_mode,
-                selection_strategy=selection_strategy
+                selection_strategy=selection_strategy,
+                lr=lr
             )
             print(f"    [{scheme_key}] Baseline Acc: {baseline_acc:.4f}")
             baselines[scheme_key] = (baseline_acc, bl_acc_hist, bl_loss_hist)
@@ -727,14 +719,10 @@ def _run_per_scheme(
 
     Returns a nested dict:  { attack_type: { scheme: { baseline: {…}, attack: {…} } } }
     """
-    # Dataset-specific learning rates
-    _DATASET_LR = {
-        'FEMNIST': 0.01,
-        'Sentiment140': 0.005,
-        'Shakespeare': 0.001,
-    }
+    # Dataset-specific learning rates and batch sizes
     if lr is None:
-        lr = _DATASET_LR.get(dataset, 0.001)
+        lr = DATASET_LR.get(dataset, 0.001)
+    _bs = DATASET_BATCH_SIZE.get(dataset, 32)
 
     dataset_results = {}
 
@@ -805,7 +793,7 @@ def _run_per_scheme(
                     committee_size_frac=committee_size_frac,
                     scoring_mode=scoring_mode,
                     selection_strategy=selection_strategy,
-                    lr=lr
+                    lr=lr, batch_size=_bs
                 )
                 print(f"    [{scheme_key}] Attack Acc: {atk_acc:.4f}, ASR: {atk_asr:.4f}")
             except Exception as e:
@@ -835,14 +823,14 @@ def _run_per_scheme(
 
 
 # =============================================================================
-# ABLATION STUDY 1: DATA POISON PERCENTAGE
+# ABLATION STUDY 6: DATA POISON PERCENTAGE
 # =============================================================================
 
 def run_data_poison_percentage_ablation(
     percentages: Optional[List[float]] = None,
     output_base: str = None,
     datasets: Optional[List[str]] = None,
-    rounds: int = 1,
+    rounds: int = None,
     total_clients: Union[int, Dict[str, int]] = 100,
     client_participation: int = 40,
     malicious_ratio: float = 0.4,
@@ -864,14 +852,14 @@ def run_data_poison_percentage_ablation(
 
 
 # =============================================================================
-# ABLATION STUDY 2: CLIENT MALICIOUS RATIO
+# ABLATION STUDY 1: CLIENT MALICIOUS RATIO
 # =============================================================================
 
 def run_client_malicious_ratio_ablation(
     ratios: Optional[List[float]] = None,
     output_base: str = None,
     datasets: Optional[List[str]] = None,
-    rounds: int = 1,
+    rounds: int = None,
     total_clients: Union[int, Dict[str, int]] = 100,
     client_participation: int = 40,
     poison_percentage: float = 0.4,
@@ -885,7 +873,7 @@ def run_client_malicious_ratio_ablation(
     selection_strategy: int = 1
 ):
     """Ablation 2 — client malicious ratio.  CMFL-paper style: every scheme
-    (FedAvg, Krum, Multi-Krum, Median, Trimmed Mean, AdaptiveCommittee, CMFL)
+    (FedAvg, Krum, Multi-Krum, Median, Trimmed Mean, CMFL)
     is tested under both baseline and attack for each client malicious ratio.
 
     ALL attacks run by default: both data-poisoning and Byzantine attacks
@@ -908,7 +896,7 @@ def run_client_malicious_ratio_ablation(
         output_base = f"{output_base}/{run_id}/ablation_client_malicious_ratio"
 
     print("\n" + "="*100)
-    print("ABLATION STUDY 2: CLIENT MALICIOUS RATIO")
+    print("ABLATION STUDY 1: CLIENT MALICIOUS RATIO")
     print("="*100)
     print(f"Run ID: {run_id}")
     print(f"Output: {output_base}")
@@ -916,7 +904,7 @@ def run_client_malicious_ratio_ablation(
     print(f"Aggregation schemes    : {[s.upper() for s in agg_schemes]}")
     print(f"Attacks                : {[a.upper() for a in attacks_to_test]}")
     print(f"Datasets               : {datasets}")
-    print(f"Rounds                 : {rounds}")
+    print(f"Rounds                 : {rounds if rounds is not None else 'per-dataset (DATASET_ROUNDS)'}")
     print(f"Fixed data poison pct  : {poison_percentage*100:.0f}%")
     print("="*100)
 
@@ -926,11 +914,12 @@ def run_client_malicious_ratio_ablation(
     # ---------- cache baselines per dataset (independent of client_malicious_ratio) ----------
     baseline_cache = {}
     for dataset in datasets:
+        _rounds = rounds if rounds is not None else DATASET_ROUNDS.get(dataset, 200)
         n_clients = _resolve_clients(total_clients, dataset)
         print(f"\n[DATASET] {dataset} — running baselines once (reused across all client malicious ratios)...")
         baseline_cache[dataset] = _run_baselines(
             framework=framework, dataset=dataset,
-            agg_schemes=agg_schemes, rounds=rounds,
+            agg_schemes=agg_schemes, rounds=_rounds,
             n_clients=n_clients, clients_per_round=client_participation,
             alpha=1.0, dataset_fraction=dataset_fraction,
             aggregation_participation_frac=aggregation_participation_frac,
@@ -943,6 +932,7 @@ def run_client_malicious_ratio_ablation(
         print(f"\n{'='*80}\nRunning with {ratio_pct}% client malicious ratio\n{'='*80}")
 
         for dataset in datasets:
+            _rounds = rounds if rounds is not None else DATASET_ROUNDS.get(dataset, 200)
             n_clients     = _resolve_clients(total_clients, dataset)
             num_malicious = int(n_clients * ratio)
             print(f"\n[DATASET] {dataset} (clients={n_clients}, malicious={num_malicious})")
@@ -951,7 +941,7 @@ def run_client_malicious_ratio_ablation(
             results[f"{ratio_pct}%"][dataset] = _run_per_scheme(
                 framework=framework, dataset=dataset,
                 agg_schemes=agg_schemes, attacks_to_test=attacks_to_test,
-                rounds=rounds, n_clients=n_clients, num_malicious=num_malicious,
+                rounds=_rounds, n_clients=n_clients, num_malicious=num_malicious,
                 clients_per_round=client_participation,
                 poison_percentage=poison_percentage, alpha=1.0,
                 dataset_fraction=dataset_fraction,
@@ -972,14 +962,14 @@ def run_client_malicious_ratio_ablation(
 
 
 # =============================================================================
-# ABLATION STUDY 3: NON-IID DATA DISTRIBUTION
+# ABLATION STUDY 8: NON-IID DATA DISTRIBUTION
 # =============================================================================
 
 def run_non_iid_ablation(
     non_iid_levels: Optional[List] = None,
     output_base: str = None,
     datasets: Optional[List[str]] = None,
-    rounds: int = 1,
+    rounds: int = None,
     total_clients: Union[int, Dict[str, int]] = 100,
     client_participation: int = 40,
     malicious_ratio: float = 0.4,
@@ -1028,7 +1018,7 @@ def run_non_iid_ablation(
         output_base = f"{output_base}/{run_id}/ablation_non_iid"
 
     print("\n" + "="*100)
-    print("ABLATION STUDY 3: NON-IID DATA DISTRIBUTION")
+    print("ABLATION STUDY 8: NON-IID DATA DISTRIBUTION")
     print("="*100)
     print(f"Run ID: {run_id}")
     print(f"Output: {output_base}")
@@ -1036,7 +1026,7 @@ def run_non_iid_ablation(
     print(f"Aggregation schemes    : {[s.upper() for s in agg_schemes]}")
     print(f"Attacks                : {[a.upper() for a in attacks_to_test]}")
     print(f"Datasets               : {datasets}")
-    print(f"Rounds                 : {rounds}")
+    print(f"Rounds                 : {rounds if rounds is not None else 'per-dataset (DATASET_ROUNDS)'}")
     print(f"Fixed malicious ratio  : {malicious_ratio*100:.0f}%")
     print(f"Fixed data poison pct  : {poison_percentage*100:.0f}%")
     print("="*100)
@@ -1050,6 +1040,7 @@ def run_non_iid_ablation(
         print(f"{'='*80}")
 
         for dataset in datasets:
+            _rounds = rounds if rounds is not None else DATASET_ROUNDS.get(dataset, 200)
             n_clients = _resolve_clients(total_clients, dataset)
             num_malicious = int(n_clients * malicious_ratio)
             print(f"\n[DATASET] {dataset} (clients={n_clients}, malicious={num_malicious})")
@@ -1059,7 +1050,7 @@ def run_non_iid_ablation(
             results[level_name][dataset] = _run_per_scheme(
                 framework=framework, dataset=dataset,
                 agg_schemes=agg_schemes, attacks_to_test=attacks_to_test,
-                rounds=rounds, n_clients=n_clients, num_malicious=num_malicious,
+                rounds=_rounds, n_clients=n_clients, num_malicious=num_malicious,
                 clients_per_round=client_participation,
                 poison_percentage=poison_percentage, alpha=alpha,
                 dataset_fraction=dataset_fraction,
@@ -1079,14 +1070,14 @@ def run_non_iid_ablation(
 
 
 # =============================================================================
-# ABLATION STUDY 4: CLIENT PARTICIPATION RATE
+# ABLATION STUDY 7: CLIENT PARTICIPATION RATE
 # =============================================================================
 
 def run_client_participation_ablation(
     participation_rates: Optional[List[float]] = None,
     output_base: str = None,
     datasets: Optional[List[str]] = None,
-    rounds: int = 1,
+    rounds: int = None,
     total_clients: Union[int, Dict[str, int]] = 100,
     malicious_ratio: float = 0.4,
     poison_percentage: float = 0.4,
@@ -1124,7 +1115,7 @@ def run_client_participation_ablation(
         output_base = f"{output_base}/{run_id}/ablation_client_participation"
 
     print("\n" + "="*100)
-    print("ABLATION STUDY 4: CLIENT PARTICIPATION RATE")
+    print("ABLATION STUDY 7: CLIENT PARTICIPATION RATE")
     print("="*100)
     print(f"Run ID: {run_id}")
     print(f"Output: {output_base}")
@@ -1132,7 +1123,7 @@ def run_client_participation_ablation(
     print(f"Aggregation schemes    : {[s.upper() for s in agg_schemes]}")
     print(f"Attacks                : {[a.upper() for a in attacks_to_test]}")
     print(f"Datasets               : {datasets}")
-    print(f"Rounds                 : {rounds}")
+    print(f"Rounds                 : {rounds if rounds is not None else 'per-dataset (DATASET_ROUNDS)'}")
     print(f"Fixed malicious ratio  : {malicious_ratio*100:.0f}%")
     print(f"Fixed data poison pct  : {poison_percentage*100:.0f}%")
     print("="*100)
@@ -1148,6 +1139,7 @@ def run_client_participation_ablation(
         print(f"{'='*80}")
 
         for dataset in datasets:
+            _rounds = rounds if rounds is not None else DATASET_ROUNDS.get(dataset, 200)
             n_clients = _resolve_clients(total_clients, dataset)
             num_malicious = int(n_clients * malicious_ratio)
             clients_per_round = max(1, int(n_clients * rate))
@@ -1158,7 +1150,7 @@ def run_client_participation_ablation(
             results[f"{rate_pct}%"][dataset] = _run_per_scheme(
                 framework=framework, dataset=dataset,
                 agg_schemes=agg_schemes, attacks_to_test=attacks_to_test,
-                rounds=rounds, n_clients=n_clients, num_malicious=num_malicious,
+                rounds=_rounds, n_clients=n_clients, num_malicious=num_malicious,
                 clients_per_round=clients_per_round,
                 poison_percentage=poison_percentage, alpha=1.0,
                 dataset_fraction=dataset_fraction,
@@ -1178,14 +1170,14 @@ def run_client_participation_ablation(
 
 
 # =============================================================================
-# ABLATION STUDY 5: AGGREGATION PARTICIPATION FRACTION (AdaptiveCommittee & CMFL)
+# ABLATION STUDY 2: AGGREGATION PARTICIPATION FRACTION (CMFL)
 # =============================================================================
 
 def run_aggregation_participation_ablation(
     participation_fracs: Optional[List[float]] = None,
     output_base: str = None,
     datasets: Optional[List[str]] = None,
-    rounds: int = 1,
+    rounds: int = None,
     total_clients: Union[int, Dict[str, int]] = 100,
     client_participation: int = 40,
     malicious_ratio: float = 0.4,
@@ -1231,7 +1223,7 @@ def run_aggregation_participation_ablation(
         output_base = f"{output_base}/{run_id}/ablation_agg_participation"
 
     print("\n" + "="*100)
-    print("ABLATION STUDY 5: AGGREGATION PARTICIPATION FRACTION (CMFL)")
+    print("ABLATION STUDY 2: AGGREGATION PARTICIPATION FRACTION (CMFL)")
     print("="*100)
     print(f"Run ID: {run_id}")
     print(f"Output: {output_base}")
@@ -1239,7 +1231,7 @@ def run_aggregation_participation_ablation(
     print(f"Aggregation schemes    : {[s.upper() for s in agg_schemes]}")
     print(f"Attacks                : {[a.upper() for a in attacks_to_test]}")
     print(f"Datasets               : {datasets}")
-    print(f"Rounds                 : {rounds}")
+    print(f"Rounds                 : {rounds if rounds is not None else 'per-dataset (DATASET_ROUNDS)'}")
     print(f"Fixed client malicious ratio: {malicious_ratio*100:.0f}%")
     print(f"Fixed data poison pct      : {poison_percentage*100:.0f}%")
     print("="*100)
@@ -1255,6 +1247,7 @@ def run_aggregation_participation_ablation(
         results[label] = {}
 
         for dataset in datasets:
+            _rounds = rounds if rounds is not None else DATASET_ROUNDS.get(dataset, 200)
             n_clients     = _resolve_clients(total_clients, dataset)
             num_malicious = int(n_clients * malicious_ratio)
             print(f"\n[DATASET] {dataset} (clients={n_clients}, malicious={num_malicious})")
@@ -1263,7 +1256,7 @@ def run_aggregation_participation_ablation(
             results[label][dataset] = _run_per_scheme(
                 framework=framework, dataset=dataset,
                 agg_schemes=agg_schemes, attacks_to_test=attacks_to_test,
-                rounds=rounds, n_clients=n_clients, num_malicious=num_malicious,
+                rounds=_rounds, n_clients=n_clients, num_malicious=num_malicious,
                 clients_per_round=client_participation,
                 poison_percentage=poison_percentage, alpha=1.0,
                 dataset_fraction=dataset_fraction,
@@ -1283,14 +1276,14 @@ def run_aggregation_participation_ablation(
 
 
 # =============================================================================
-# ABLATION STUDY 6: COMMITTEE SIZE (AdaptiveCommittee & CMFL)
+# ABLATION STUDY 3: COMMITTEE SIZE (CMFL)
 # =============================================================================
 
 def run_committee_size_ablation(
     committee_size_fracs: Optional[List[float]] = None,
     output_base: str = None,
     datasets: Optional[List[str]] = None,
-    rounds: int = 1,
+    rounds: int = None,
     total_clients: Union[int, Dict[str, int]] = 100,
     client_participation: int = 40,
     malicious_ratio: float = 0.4,
@@ -1333,7 +1326,7 @@ def run_committee_size_ablation(
         output_base = f"{output_base}/{run_id}/ablation_committee_size"
 
     print("\n" + "="*100)
-    print("ABLATION STUDY 6: COMMITTEE SIZE (CMFL)")
+    print("ABLATION STUDY 3: COMMITTEE SIZE (CMFL)")
     print("="*100)
     print(f"Run ID: {run_id}")
     print(f"Output: {output_base}")
@@ -1341,7 +1334,7 @@ def run_committee_size_ablation(
     print(f"Aggregation schemes    : {[s.upper() for s in agg_schemes]}")
     print(f"Attacks                : {[a.upper() for a in attacks_to_test]}")
     print(f"Datasets               : {datasets}")
-    print(f"Rounds                 : {rounds}")
+    print(f"Rounds                 : {rounds if rounds is not None else 'per-dataset (DATASET_ROUNDS)'}")
     print(f"Fixed client malicious ratio: {malicious_ratio*100:.0f}%")
     print(f"Fixed data poison pct      : {poison_percentage*100:.0f}%")
     print("="*100)
@@ -1355,6 +1348,7 @@ def run_committee_size_ablation(
         results[f"{frac_pct}%"] = {}
 
         for dataset in datasets:
+            _rounds = rounds if rounds is not None else DATASET_ROUNDS.get(dataset, 200)
             n_clients     = _resolve_clients(total_clients, dataset)
             num_malicious = int(n_clients * malicious_ratio)
             print(f"\n[DATASET] {dataset} (clients={n_clients}, malicious={num_malicious})")
@@ -1363,7 +1357,7 @@ def run_committee_size_ablation(
             results[f"{frac_pct}%"][dataset] = _run_per_scheme(
                 framework=framework, dataset=dataset,
                 agg_schemes=agg_schemes, attacks_to_test=attacks_to_test,
-                rounds=rounds, n_clients=n_clients, num_malicious=num_malicious,
+                rounds=_rounds, n_clients=n_clients, num_malicious=num_malicious,
                 clients_per_round=client_participation,
                 poison_percentage=poison_percentage, alpha=1.0,
                 dataset_fraction=dataset_fraction,
@@ -1383,14 +1377,14 @@ def run_committee_size_ablation(
 
 
 # =============================================================================
-# ABLATION STUDY 7: COMMITTEE MEMBER MALICIOUS TRACKING
+# ABLATION STUDY 4: COMMITTEE MEMBER MALICIOUS TRACKING
 # =============================================================================
 
 def run_committee_malicious_tracking_ablation(
     ratios: Optional[List[float]] = None,
     output_base: str = None,
     datasets: Optional[List[str]] = None,
-    rounds: int = 100,
+    rounds: int = None,
     total_clients: Union[int, Dict[str, int]] = 100,
     client_participation: int = 20,
     poison_percentage: float = 0.4,
@@ -1436,7 +1430,7 @@ def run_committee_malicious_tracking_ablation(
         output_base = f"{output_base}/{run_id}/ablation_committee_malicious_tracking"
 
     print("\n" + "=" * 100)
-    print("ABLATION STUDY 7: COMMITTEE MEMBER MALICIOUS TRACKING")
+    print("ABLATION STUDY 4: COMMITTEE MEMBER MALICIOUS TRACKING")
     print("=" * 100)
     print(f"Run ID: {run_id}")
     print(f"Output: {output_base}")
@@ -1444,7 +1438,7 @@ def run_committee_malicious_tracking_ablation(
     print(f"Aggregation schemes    : {[s.upper() for s in _COMMITTEE_ONLY]}")
     print(f"Attacks                : {[a.upper() for a in attacks_to_test]}")
     print(f"Datasets               : {datasets}")
-    print(f"Rounds                 : {rounds}")
+    print(f"Rounds                 : {rounds if rounds is not None else 'per-dataset (DATASET_ROUNDS)'}")
     print(f"Committee size frac    : {committee_size_frac*100:.0f}%")
     print(f"Agg participation frac : {aggregation_participation_frac*100:.0f}%")
     print(f"Fixed data poison pct  : {poison_percentage*100:.0f}%")
@@ -1459,6 +1453,7 @@ def run_committee_malicious_tracking_ablation(
         results[f"{ratio_pct}%"] = {}
 
         for dataset in datasets:
+            _rounds = rounds if rounds is not None else DATASET_ROUNDS.get(dataset, 200)
             n_clients = _resolve_clients(total_clients, dataset)
             num_malicious = int(n_clients * ratio)
             clients_per_round = client_participation if isinstance(client_participation, int) else max(1, int(n_clients * 0.2))
@@ -1470,7 +1465,7 @@ def run_committee_malicious_tracking_ablation(
             # ── Baselines (clean, no attack) for CMFL schemes ──
             baselines = _run_baselines(
                 framework=framework, dataset=dataset,
-                agg_schemes=_COMMITTEE_ONLY, rounds=rounds,
+                agg_schemes=_COMMITTEE_ONLY, rounds=_rounds,
                 n_clients=n_clients, clients_per_round=clients_per_round,
                 alpha=1.0, dataset_fraction=dataset_fraction,
                 aggregation_participation_frac=aggregation_participation_frac,
@@ -1529,8 +1524,8 @@ def run_committee_malicious_tracking_ablation(
                     tc = max(4, clients_per_round - cs)
 
                     # Dataset-specific learning rate
-                    _DS_LR = {'FEMNIST': 0.01, 'Sentiment140': 0.005, 'Shakespeare': 0.001}
-                    _lr = _DS_LR.get(dataset, 0.001)
+                    _lr = DATASET_LR.get(dataset, 0.001)
+                    _bs = DATASET_BATCH_SIZE.get(dataset, 32)
 
                     try:
                         coordinator = DecentralizedFLCoordinator(
@@ -1543,19 +1538,19 @@ def run_committee_malicious_tracking_ablation(
                             clients_per_round=clients_per_round,
                             aggregation_participation_frac=aggregation_participation_frac,
                             selection_strategy=sel_strat,
-                            lr=_lr
+                            lr=_lr, batch_size=_bs
                         )
 
                         test_acc_history = []
-                        eval_interval = max(1, rounds // 20) if rounds > 20 else 1
+                        eval_interval = max(1, _rounds // 20) if _rounds > 20 else 1
 
-                        for rnd in range(1, rounds + 1):
+                        for rnd in range(1, _rounds + 1):
                             coordinator.run_federated_learning(
                                 rounds=1, aggregation_method=scheme,
                                 test_loader=test_loader,
-                                round_offset=rnd - 1, total_rounds=rounds
+                                round_offset=rnd - 1, total_rounds=_rounds
                             )
-                            if rnd % eval_interval == 0 or rnd == rounds:
+                            if rnd % eval_interval == 0 or rnd == _rounds:
                                 try:
                                     acc, _ = coordinator.evaluate_on_test_set(test_loader)
                                     if math.isnan(acc) or math.isinf(acc):
@@ -1584,7 +1579,7 @@ def run_committee_malicious_tracking_ablation(
 
                         print(f"    [{scheme_key}] Acc={final_accuracy:.4f}, "
                               f"Avg mal in committee={committee_tracking.get('avg_malicious_count', 0):.2f}/{cs}, "
-                              f"Rounds with mal={committee_tracking.get('rounds_with_malicious', 0)}/{rounds}")
+                              f"Rounds with mal={committee_tracking.get('rounds_with_malicious', 0)}/{_rounds}")
 
                         dataset_attack_results[attack_type][scheme_key] = {
                             'baseline': {
@@ -1635,12 +1630,12 @@ def run_committee_malicious_tracking_ablation(
 
 
 # =============================================================================
-# ABLATION STUDY 8: EFFICIENCY EXPERIMENT (CMFL Paper Section 6.5)
+# ABLATION STUDY 5: EFFICIENCY EXPERIMENT (CMFL Paper Section 6.5)
 # =============================================================================
 
 def run_efficiency_experiment(
     datasets=None,
-    rounds=600,
+    rounds=None,
     total_clients=108,
     committee_size_frac=0.40,
     aggregation_participation_frac=0.40,
@@ -1691,12 +1686,12 @@ def run_efficiency_experiment(
         return {}
 
     print("\n" + "=" * 100)
-    print("ABLATION STUDY 8: EFFICIENCY EXPERIMENT (CMFL Paper Section 6.5)")
+    print("ABLATION STUDY 5: EFFICIENCY EXPERIMENT (CMFL Paper Section 6.5)")
     print("=" * 100)
     print(f"Run ID: {run_id}")
     print(f"Output: {output_base}")
     print(f"Datasets             : {datasets}")
-    print(f"Rounds               : {rounds}")
+    print(f"Rounds               : {rounds if rounds is not None else 'per-dataset (DATASET_ROUNDS)'}")
     print(f"Total clients        : {total_clients}")
     print(f"Committee size frac  : {committee_size_frac * 100:.0f}%")
     print(f"Agg participation    : {aggregation_participation_frac * 100:.0f}%")
@@ -1714,6 +1709,7 @@ def run_efficiency_experiment(
     gossip_k = 3  # GossipFL default neighbor count
 
     for dataset in datasets:
+        _rounds = rounds if rounds is not None else DATASET_ROUNDS.get(dataset, 200)
         print(f"\n{'#' * 100}")
         print(f"#  EFFICIENCY: {dataset}")
         print(f"{'#' * 100}")
@@ -1748,28 +1744,28 @@ def run_efficiency_experiment(
         print(f"[INFO] Model size: {model_size_bytes:,} bytes ({model_size_bytes / 1024:.1f} KB)")
 
         # ── Run 1: Typical FL (FedAvg) ──
-        print(f"\n  [Typical FL] Running {rounds} rounds...")
+        print(f"\n  [Typical FL] Running {_rounds} rounds...")
         # Snapshot client state for reuse
         for c in clients:
             c.snapshot_state()
 
-        _DS_LR_eff = {'FEMNIST': 0.01, 'Sentiment140': 0.005, 'Shakespeare': 0.001}
-        _lr_eff = _DS_LR_eff.get(dataset, 0.001)
+        _lr_eff = DATASET_LR.get(dataset, 0.001)
+        _bs_eff = DATASET_BATCH_SIZE.get(dataset, 32)
 
         coordinator_fl = DecentralizedFLCoordinator(
             clients, use_defense=False, defense_type=None,
             aggregation_method='fedavg', clients_per_round=clients_per_round,
-            lr=_lr_eff
+            lr=_lr_eff, batch_size=_bs_eff
         )
 
-        eval_interval = max(1, rounds // 20) if rounds > 20 else 1
+        eval_interval = max(1, _rounds // 20) if _rounds > 20 else 1
         fl_acc_history = []
-        for rnd in range(1, rounds + 1):
+        for rnd in range(1, _rounds + 1):
             coordinator_fl.run_federated_learning(
                 rounds=1, aggregation_method='fedavg',
-                test_loader=test_loader, round_offset=rnd - 1, total_rounds=rounds
+                test_loader=test_loader, round_offset=rnd - 1, total_rounds=_rounds
             )
-            if rnd % eval_interval == 0 or rnd == rounds:
+            if rnd % eval_interval == 0 or rnd == _rounds:
                 try:
                     acc, _ = coordinator_fl.evaluate_on_test_set(test_loader)
                     fl_acc_history.append(float(acc))
@@ -1784,7 +1780,7 @@ def run_efficiency_experiment(
         print(f"  [Typical FL] Done. Accuracy={fl_accuracy:.4f}, Total comp={fl_total_comp:.1f}s")
 
         # ── Run 2: CMFL Strategy I ──
-        print(f"\n  [CMFL] Running {rounds} rounds...")
+        print(f"\n  [CMFL] Running {_rounds} rounds...")
         for c in clients:
             c.reset_for_new_run()
 
@@ -1797,16 +1793,16 @@ def run_efficiency_experiment(
             clients_per_round=clients_per_round,
             aggregation_participation_frac=aggregation_participation_frac,
             selection_strategy=selection_strategy,
-            lr=_lr_eff
+            lr=_lr_eff, batch_size=_bs_eff
         )
 
         cmfl_acc_history = []
-        for rnd in range(1, rounds + 1):
+        for rnd in range(1, _rounds + 1):
             coordinator_cmfl.run_federated_learning(
                 rounds=1, aggregation_method='cmfl',
-                test_loader=test_loader, round_offset=rnd - 1, total_rounds=rounds
+                test_loader=test_loader, round_offset=rnd - 1, total_rounds=_rounds
             )
-            if rnd % eval_interval == 0 or rnd == rounds:
+            if rnd % eval_interval == 0 or rnd == _rounds:
                 try:
                     acc, _ = coordinator_cmfl.evaluate_on_test_set(test_loader)
                     cmfl_acc_history.append(float(acc))
@@ -1823,7 +1819,7 @@ def run_efficiency_experiment(
         # ── Compute efficiency metrics for each transmission rate ──
         ds_results = {
             'model_size_bytes': model_size_bytes,
-            'rounds': rounds,
+            'rounds': _rounds,
             'total_clients': n_clients,
             'committee_size': committee_size,
             'training_clients': training_clients,
@@ -1867,36 +1863,36 @@ def run_efficiency_experiment(
             cmfl_total_time = sum(ct + cmfl_comm_per_round for ct in cmfl_round_times)
 
             # ── Total communication overhead (bytes) ──
-            fl_total_comm = fl_data_per_round * rounds
-            bt_total_comm = bt_data_per_round * rounds
-            gfl_total_comm = gfl_data_per_round * rounds
-            cmfl_total_comm = cmfl_data_per_round * rounds
+            fl_total_comm = fl_data_per_round * _rounds
+            bt_total_comm = bt_data_per_round * _rounds
+            gfl_total_comm = gfl_data_per_round * _rounds
+            cmfl_total_comm = cmfl_data_per_round * _rounds
 
             ds_results[rate_key] = {
                 'typical_fl': {
                     'total_time': fl_total_time,
                     'comm_overhead_bytes': fl_total_comm,
                     'comp_time': fl_total_comp,
-                    'comm_time_total': fl_comm_per_round * rounds,
+                    'comm_time_total': fl_comm_per_round * _rounds,
                     'accuracy': fl_accuracy,
                 },
                 'braintorrent': {
                     'total_time': bt_total_time,
                     'comm_overhead_bytes': bt_total_comm,
                     'comp_time': fl_total_comp,
-                    'comm_time_total': bt_comm_per_round * rounds,
+                    'comm_time_total': bt_comm_per_round * _rounds,
                 },
                 'gossipfl': {
                     'total_time': gfl_total_time,
                     'comm_overhead_bytes': gfl_total_comm,
                     'comp_time': fl_total_comp,
-                    'comm_time_total': gfl_comm_per_round * rounds,
+                    'comm_time_total': gfl_comm_per_round * _rounds,
                 },
                 'cmfl': {
                     'total_time': cmfl_total_time,
                     'comm_overhead_bytes': cmfl_total_comm,
                     'comp_time': cmfl_total_comp,
-                    'comm_time_total': cmfl_comm_per_round * rounds,
+                    'comm_time_total': cmfl_comm_per_round * _rounds,
                     'accuracy': cmfl_accuracy,
                 },
             }
@@ -1975,9 +1971,9 @@ Examples:
     parser.add_argument('--client-participation', action='store_true',
                        help='Ablation: Client participation rate (20%%, 40%%, 60%%, 80%%)')
     parser.add_argument('--aggregation-participation', action='store_true',
-                       help='Ablation: Aggregation participation fraction (AdaptiveCommittee & CMFL only)')
+                       help='Ablation: Aggregation participation fraction (CMFL only)')
     parser.add_argument('--committee-size', action='store_true',
-                       help='Ablation: Committee size fraction (AdaptiveCommittee & CMFL only)')
+                       help='Ablation: Committee size fraction (CMFL only)')
 
     # Parameter customization
     parser.add_argument('--percentages', nargs='+', type=float,
@@ -1991,15 +1987,15 @@ Examples:
 
     # General parameters
     parser.add_argument('--datasets', nargs='+', type=str, default=None,
-                       help='Datasets to use (default: FEMNIST Fashion-MNIST EMNIST CIFAR-10 Shakespeare Sentiment140)')
-    parser.add_argument('--rounds', type=int, default=20,
-                       help='Number of FL rounds (default: 20)')
+                       help='Datasets to use (default: FEMNIST Shakespeare Sentiment140)')
+    parser.add_argument('--rounds', type=int, default=None,
+                       help='Number of FL rounds (default: per-dataset — FEMNIST=600, Shakespeare=500, Sentiment140=1000)')
     parser.add_argument('--total-clients', type=int, default=100,
                        help='Total number of clients (default: 100 for scalability study)')
     parser.add_argument('--attacks', nargs='+', type=str, default=None,
                        help='Attacks to test (default: per-ablation — data-poisoning for poison%%, all 9 for others)')
     parser.add_argument('--defenses', nargs='+', type=str, default=None,
-                       help='Defenses to test (default: both committee-based defenses - adaptivecommittee, cmfl)')
+                       help='Defenses to test (default: cmfl)')
     parser.add_argument('--dataset-fraction', type=float, default=1.0,
                        help='Fraction of dataset to use (default: 1.0 = 100%%, 0.1 = 10%%)')
 
@@ -2016,14 +2012,14 @@ Examples:
         sys.exit(1)
 
     # Determine datasets
-    datasets = args.datasets if args.datasets else ['FEMNIST', 'Fashion-MNIST', 'EMNIST', 'CIFAR-10', 'Shakespeare', 'Sentiment140']
+    datasets = args.datasets if args.datasets else ['FEMNIST', 'Shakespeare', 'Sentiment140']
 
     print("\n" + "="*100)
     print("COMPREHENSIVE ABLATION STUDY FOR FEDERATED LEARNING DEFENSE")
     print("="*100)
     print(f"\nConfiguration:")
     print(f"  Datasets: {datasets}")
-    print(f"  Rounds: {args.rounds}")
+    print(f"  Rounds: {args.rounds if args.rounds is not None else 'per-dataset (FEMNIST=600, Shakespeare=500, Sentiment140=1000)'}")
     print(f"  Total clients: {args.total_clients}")
     if args.attacks:
         print(f"  Attacks: {args.attacks}")

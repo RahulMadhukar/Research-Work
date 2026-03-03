@@ -17,15 +17,11 @@ if __name__ == "__main__":
                         choices=["standard", "comprehensive"],
                         help="Evaluation mode: standard (default) or comprehensive (test all defenses)")
     parser.add_argument("--resume", type=str, help="Path to saved JSON results to resume from")
-    parser.add_argument("--resume-checkpoint", action='store_true',
-                        help="Resume from last checkpoint (comprehensive mode)")
-    parser.add_argument("--checkpoint-interval", type=int, default=5,
-                        help="Save checkpoint every N rounds (default: 5)")
     parser.add_argument("--outdir", type=str, default="plots", help="Base directory for saving results")
     parser.add_argument("--defenses", type=str, nargs='+',
-                        default=["adaptivecommittee", "cmfl"],
-                        choices=["adaptivecommittee", "cmfl", "all"],
-                        help="Defense types to test (standard mode - both committee-based)")
+                        default=["cmfl"],
+                        choices=["cmfl", "all"],
+                        help="Defense types to test (standard mode - committee-based)")
     parser.add_argument("--subset", type=float, default=0.25,
                         help="Dataset subset fraction (0.1 = 10%%)")
     parser.add_argument("--clients", type=int, default=25,
@@ -56,8 +52,7 @@ if __name__ == "__main__":
         print(f"  Dataset subset: {args.subset*100:.0f}%")
         print(f"  Number of clients: {args.clients}")
         print(f"  FL rounds: {args.rounds}")
-        print(f"\nTesting ALL 2 committee-based defenses:")
-        print(f"  ✓ Adaptive Committee Defense (AdaptiveCommitteeDefense)")
+        print(f"\nTesting CMFL committee-based defense:")
         print(f"  ✓ CMFL Defense (CMFLDefense)")
         print(f"\nAgainst ALL attacks:")
         print(f"  ✓ Static Label Flipping (SLF)")
@@ -80,9 +75,7 @@ if __name__ == "__main__":
                 subset_fraction=args.subset,
                 num_clients=args.clients,
                 rounds=args.rounds,
-                out_dir=args.outdir,
-                resume_checkpoint=args.resume_checkpoint,
-                checkpoint_interval=args.checkpoint_interval
+                out_dir=args.outdir
             )
 
             print("\n" + "="*100)
@@ -104,7 +97,7 @@ if __name__ == "__main__":
     else:
         # Parse defenses
         if "all" in args.defenses:
-            defenses_to_test = ["adaptivecommittee", "cmfl"]
+            defenses_to_test = ["cmfl"]
         else:
             defenses_to_test = args.defenses
 

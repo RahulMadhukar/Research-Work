@@ -171,7 +171,7 @@ def extract_metrics_from_ablation(results):
                             rows.append(_extract_row(
                                 param_value, dataset, attack_type,
                                 scheme, sc, attack_data[scenario_key]))
-                    for def_key in ('adaptivecommittee', 'cmfl'):
+                    for def_key in ('cmfl',):
                         if def_key in attack_data and isinstance(attack_data[def_key], dict):
                             rows.append(_extract_row(
                                 param_value, dataset, attack_type,
@@ -242,10 +242,10 @@ def generate_summary_table(df, output_dir, ablation_type=""):
         id_cols = ['Dataset', 'Attack', 'Scheme', 'Scenario']
     else:
         # Old format: rows grouped by (dataset, scenario)
-        _SCENARIO_ORDER = ['baseline', 'attack', 'adaptivecommittee', 'cmfl']
+        _SCENARIO_ORDER = ['baseline', 'attack', 'cmfl']
         _SCENARIO_LABELS = {
             'baseline': 'Baseline', 'attack': 'Attack (no defense)',
-            'adaptivecommittee': 'Adaptive Committee', 'cmfl': 'CMFL',
+            'cmfl': 'CMFL',
         }
         for dataset in df['dataset'].unique():
             for scenario in _SCENARIO_ORDER:
@@ -363,20 +363,19 @@ def generate_detection_metrics_table(df, output_dir, ablation_type=""):
 
     # Select defense rows: new format uses scheme column, old format uses scenario
     if has_schemes:
-        defense_keys = ['ADAPTIVECOMMITTEE', 'CMFL']
+        defense_keys = ['CMFL']
         defense_df = df[
             (df['scheme'].str.upper().isin(defense_keys)) &
             (df['scenario'] == 'attack')
         ].copy()
         label_col = 'scheme'
     else:
-        defense_keys = ['adaptivecommittee', 'cmfl']
+        defense_keys = ['cmfl']
         defense_df = df[df['scenario'].isin(defense_keys)].copy()
         label_col = 'scenario'
 
     _DEFENSE_LABELS = {
-        'adaptivecommittee': 'Adaptive Committee', 'cmfl': 'CMFL',
-        'ADAPTIVECOMMITTEE': 'Adaptive Committee', 'CMFL': 'CMFL',
+        'cmfl': 'CMFL', 'CMFL': 'CMFL',
     }
 
     if len(defense_df) == 0:
@@ -546,7 +545,7 @@ def generate_plots(df, output_dir):
         # Old format plotting (scenario-based)
         _PLOT_LABELS = {
             'baseline': 'Baseline', 'attack': 'Attack (no defense)',
-            'adaptivecommittee': 'Adaptive Committee', 'cmfl': 'CMFL',
+            'cmfl': 'CMFL',
         }
 
         n_ds = min(4, len(datasets))
@@ -556,7 +555,7 @@ def generate_plots(df, output_dir):
         for idx, dataset in enumerate(datasets[:4]):
             ax = axes[idx // 2, idx % 2]
             ds_df = df[df['dataset'] == dataset]
-            for scenario in ['baseline', 'attack', 'adaptivecommittee', 'cmfl']:
+            for scenario in ['baseline', 'attack', 'cmfl']:
                 sub = ds_df[ds_df['scenario'] == scenario]
                 if len(sub) > 0:
                     sub = sub.sort_values('parameter_value')

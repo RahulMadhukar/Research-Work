@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from typing import List
 from collections import defaultdict
-from defense import AdaptiveCommitteeDefense, CMFLDefense
+from defense import CMFLDefense
 
 
 class DecentralizedFLCoordinator:
@@ -16,18 +16,16 @@ class DecentralizedFLCoordinator:
     - Provides evaluation capabilities for attack success rates
     """
 
-    def __init__(self, clients, use_defense=True, num_peers=3, defense_type='adaptivecommittee',
+    def __init__(self, clients, use_defense=True, defense_type='cmfl',
                  clients_per_round=None, aggregation_method='fedavg', use_anomaly_detection=None,
-                 lr=0.01, batch_size=None, epochs=1, **defense_kwargs):
+                 lr=0.001, batch_size=None, epochs=1, **defense_kwargs):
         """
         Initialize the federated learning coordinator.
 
         Args:
             clients: List of DecentralizedClient instances
             use_defense: Whether to use committee-based architecture (default: True)
-                        DEPRECATED: Use defense_type to control committee structure
-            num_peers: Number of peers for decentralized communication (unused in current impl)
-            defense_type: Type of defense ('adaptivecommittee', 'cmfl', 'none')
+            defense_type: Type of defense ('cmfl', 'none')
                          If not 'none', always creates committee structure
             clients_per_round: Number of clients to participate per round (None = all clients)
             aggregation_method: Aggregation method for both defense and non-defense scenarios
@@ -54,20 +52,12 @@ class DecentralizedFLCoordinator:
 
         # Initialize committee structure (ALWAYS if defense_type specified)
         if defense_type and defense_type != 'none':
-            if defense_type == 'cmfl':
-                self.defense = CMFLDefense(
-                    num_clients=len(clients),
-                    aggregation_method=aggregation_method,
-                    **defense_kwargs
-                )
-                self.committee_defense = None
-            else:
-                self.defense = AdaptiveCommitteeDefense(
-                    num_clients=len(clients),
-                    aggregation_method=aggregation_method,
-                    **defense_kwargs
-                )
-                self.committee_defense = self.defense
+            self.defense = CMFLDefense(
+                num_clients=len(clients),
+                aggregation_method=aggregation_method,
+                **defense_kwargs
+            )
+            self.committee_defense = None
         else:
             self.defense = None
             self.committee_defense = None
@@ -148,7 +138,7 @@ class DecentralizedFLCoordinator:
                           or current_round % 10 == 0)
 
             # --- Client selection ---
-            if self.defense and self.defense_type in ['cmfl', 'adaptivecommittee']:
+            if self.defense and self.defense_type == 'cmfl':
                 training_client_ids = self.defense.activate_training_clients()
                 active_client_ids = training_client_ids + list(self.defense.committee_members)
             else:
@@ -193,7 +183,7 @@ class DecentralizedFLCoordinator:
                 client = self.clients[client_id]
                 params, loss, acc = client.local_training(epochs=self._epochs, lr=self._lr, batch_size=self._batch_size)
 
-                if self.defense and self.defense_type in ['cmfl', 'adaptivecommittee']:
+                if self.defense and self.defense_type == 'cmfl':
                     client_id_to_update[client_id] = params
                 else:
                     local_updates.append(params)
@@ -246,29 +236,6 @@ class DecentralizedFLCoordinator:
                     self.enhanced_metrics['defense_stats'].append(defense_metrics)
                     self.enhanced_metrics['reputation_scores'].append(defense_metrics.get('reputation_scores', {}))
 
-                elif self.defense_type == 'adaptivecommittee':
-                    client_losses_dict = {cid: client_losses[i] for i, cid in enumerate(active_client_ids)}
-                    global_params, anomalous_clients, defense_metrics = self.defense.adaptive_committee_round(
-                        client_id_to_update, client_losses_dict,
-                        malicious_client_ids=malicious_ids_for_diagnostics,
-                        all_clients=self.clients,
-                        use_anomaly_detection=self.use_anomaly_detection,
-                        client_data_sizes=client_data_sizes
-                    )
-                    self.enhanced_metrics['defense_stats'].append(defense_metrics)
-                    self.enhanced_metrics['reputation_scores'].append(defense_metrics.get('reputation_scores', {}))
-                    self.enhanced_metrics['adaptive_thresholds'].append(self.defense.threshold)
-
-                elif self.defense_type == 'adaptive':
-                    reputation_scores = getattr(self, 'reputation_scores', None)
-                    anomalous_clients = self.defense.detect_anomalies(local_updates, client_losses, reputation_scores)
-                    global_params = self.defense.robust_aggregate(local_updates, anomalous_clients, reputation_scores)
-                    self.enhanced_metrics['adaptive_thresholds'].append(self.defense.threshold)
-
-                else:
-                    anomalous_clients = self.committee_defense.detect_anomalies(local_updates, client_losses=client_losses)
-                    global_params = self.committee_defense.robust_aggregate(local_updates, anomalous_clients)
-
                 # Merge NaN-flagged clients and update metrics
                 if self.use_anomaly_detection:
                     if hasattr(self, '_nan_flagged_clients') and self._nan_flagged_clients:
@@ -311,27 +278,67 @@ class DecentralizedFLCoordinator:
                                 param.data.copy_(global_params[name])
             _t_dist = time.time() - _t_dist_start
 
+            # --- Evaluate test accuracy & loss on global model each round ---
+            test_accuracy = 0.0
+            test_loss = np.inf
+            if test_loader is not None and not has_nan_params:
+                test_accuracy, test_loss = self.evaluate_on_test_set(test_loader)
+
+            # --- Per-round detection metrics ---
+            round_detection = None
+            if self.defense and self.use_anomaly_detection:
+                actual_set = set(malicious_ids)
+                detected_set = set(anomalous_clients)
+                participating = set(active_client_ids)
+
+                mal_in_round = participating & actual_set
+                benign_in_round = participating - actual_set
+
+                tp = len(mal_in_round & detected_set)
+                fp = len(benign_in_round & detected_set)
+                fn = len(mal_in_round - detected_set)
+                tn = len(benign_in_round - detected_set)
+                total_p = tp + fp + fn + tn
+
+                precision = (tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
+                recall = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
+                f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+                fpr_val = (fp / (fp + tn) * 100) if (fp + tn) > 0 else 0.0
+                fnr_val = 100.0 - recall
+                dacc = ((tp + tn) / total_p * 100) if total_p > 0 else 0.0
+
+                round_detection = {
+                    'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
+                    'precision': precision, 'recall': recall,
+                    'f1_score': f1, 'fpr': fpr_val, 'fnr': fnr_val, 'dacc': dacc,
+                    'num_participants': len(participating),
+                    'num_malicious': len(mal_in_round),
+                    'num_benign': len(benign_in_round),
+                    'flagged': sorted(list(detected_set)),
+                }
+
             # --- Track performance ---
             if valid_loss_clients:
                 valid_indices = [i for i, cid in enumerate(active_client_ids) if cid in valid_loss_clients]
                 valid_losses = [client_losses[i] for i in valid_indices if np.isfinite(client_losses[i])]
-                avg_accuracy = 0.0  # local accuracy removed for speed
                 avg_loss = np.mean(valid_losses) if valid_losses else np.inf
             else:
-                avg_accuracy = 0.0
                 avg_loss = np.inf
 
-            self.global_accuracy_history.append(avg_accuracy)
-            loss_history.append(avg_loss)
-            accuracy_history.append(avg_accuracy)
+            self.global_accuracy_history.append(test_accuracy)
+            loss_history.append(test_loss if test_loader is not None else avg_loss)
+            accuracy_history.append(test_accuracy)
 
             self.round_history.append({
                 'round': current_round,
                 'client_accuracies': client_accuracies.copy(),
-                'avg_accuracy': avg_accuracy,
+                'avg_accuracy': test_accuracy,
                 'client_losses': client_losses.copy(),
                 'avg_loss': avg_loss,
-                'anomalous_clients': anomalous_clients.copy()
+                'test_accuracy': test_accuracy,
+                'test_loss': test_loss,
+                'anomalous_clients': anomalous_clients.copy(),
+                'detection_metrics': round_detection,
             })
 
             # --- Timing ---
@@ -341,21 +348,27 @@ class DecentralizedFLCoordinator:
             self.round_times.append(round_duration)
             self.cumulative_times.append(cumulative_time)
 
-            # Print concise progress at milestones only
-            if _milestone:
-                model_name = type(self.clients[0].model).__name__
-                print(f"  [R{current_round}/{display_total}] {round_duration:.1f}s/round "
-                      f"(train={_t_train:.1f}s [{len(active_client_ids)} clients], "
-                      f"agg={_t_agg:.1f}s, dist={_t_dist:.1f}s) | "
-                      f"Total: {cumulative_time:.0f}s ({cumulative_time/60:.1f}min) | "
-                      f"AvgLoss: {avg_loss:.4f} | Model: {model_name}")
+            # --- Print per-round summary ---
+            print(f"  [R{current_round}/{display_total}] "
+                  f"TestAcc: {test_accuracy*100:.2f}% | TestLoss: {test_loss:.4f} | "
+                  f"TrainLoss: {avg_loss:.4f} | "
+                  f"{round_duration:.1f}s/round ({len(active_client_ids)} clients)", end="")
 
-        # --- Defense summary on truly final round ---
+            if round_detection:
+                print(f" | TP={round_detection['tp']} FP={round_detection['fp']} "
+                      f"TN={round_detection['tn']} FN={round_detection['fn']} "
+                      f"Prec={round_detection['precision']:.1f}% "
+                      f"Rec={round_detection['recall']:.1f}% "
+                      f"FPR={round_detection['fpr']:.1f}%")
+            else:
+                print()
+
+        # --- Final summary ---
         current_final_round = round_offset + rounds
         is_truly_final = (total_rounds is None) or (current_final_round >= total_rounds)
 
-        if self.use_defense and self.use_anomaly_detection and is_truly_final:
-            self._print_defense_summary()
+        if is_truly_final:
+            self._print_final_summary()
 
         return self.global_accuracy_history, loss_history, self.round_history
 
@@ -448,65 +461,68 @@ class DecentralizedFLCoordinator:
         else:
             self.committee_metrics['false_positive_rate'] = 0.0
 
-    def _print_defense_summary(self):
-        """Print summary of defense effectiveness across all rounds."""
-        # UPDATED: Use defense object's comprehensive final summary if available
-        if hasattr(self.defense, 'print_final_detection_summary'):
-            # Use the new comprehensive final detection metrics summary
-            self.defense.print_final_detection_summary(self.clients)
+    def _print_final_summary(self):
+        """Print final summary: per-round test accuracy/loss and detection metrics."""
+        num_rounds = len(self.round_history)
+        has_detection = any(r.get('detection_metrics') is not None for r in self.round_history)
+
+        print("\n" + "=" * 100)
+        print("FINAL TRAINING SUMMARY")
+        print("=" * 100)
+
+        # Header
+        if has_detection:
+            print(f"{'Round':>5} | {'TestAcc':>8} | {'TestLoss':>9} | {'TrainLoss':>10} | "
+                  f"{'TP':>3} {'FP':>3} {'TN':>3} {'FN':>3} | "
+                  f"{'Prec%':>6} {'Rec%':>6} {'FPR%':>6} {'F1%':>6} {'DAcc%':>6}")
+            print("-" * 100)
         else:
-            # Fallback to legacy summary for backward compatibility
-            print("\n[DEFENSE SUMMARY] Overall effectiveness:")
+            print(f"{'Round':>5} | {'TestAcc':>8} | {'TestLoss':>9} | {'TrainLoss':>10}")
+            print("-" * 50)
 
-            total_detections = 0
-            correct_detections = 0
-            false_positives = 0
-            actual_malicious_ids = set([c.client_id for c in self.clients if c.is_malicious])
+        for r in self.round_history:
+            rnd = r['round']
+            tacc = r.get('test_accuracy', 0.0) * 100
+            tloss = r.get('test_loss', np.inf)
+            train_loss = r.get('avg_loss', np.inf)
 
-            for round_info in self.round_history:
-                detected = set(round_info['anomalous_clients'])
-                correct = detected & actual_malicious_ids
-                false_pos = detected - actual_malicious_ids
-
-                total_detections += len(detected)
-                correct_detections += len(correct)
-                false_positives += len(false_pos)
-
-            # Precision
-            if total_detections > 0:
-                precision = correct_detections / total_detections * 100
-                print(f"  Precision: {precision:.1f}% ({correct_detections}/{total_detections} detections correct)")
+            if has_detection and r.get('detection_metrics'):
+                dm = r['detection_metrics']
+                print(f"{rnd:>5} | {tacc:>7.2f}% | {tloss:>9.4f} | {train_loss:>10.4f} | "
+                      f"{dm['tp']:>3} {dm['fp']:>3} {dm['tn']:>3} {dm['fn']:>3} | "
+                      f"{dm['precision']:>5.1f} {dm['recall']:>5.1f} "
+                      f"{dm['fpr']:>5.1f} {dm['f1_score']:>5.1f} {dm['dacc']:>5.1f}")
             else:
-                print(f"  Precision: N/A (no detections made)")
+                print(f"{rnd:>5} | {tacc:>7.2f}% | {tloss:>9.4f} | {train_loss:>10.4f}")
 
-            # Recall
-            if len(actual_malicious_ids) > 0:
-                all_detected_malicious = set()
-                for round_info in self.round_history:
-                    detected = set(round_info['anomalous_clients'])
-                    all_detected_malicious.update(detected & actual_malicious_ids)
+        print("=" * 100)
 
-                recall = len(all_detected_malicious) / len(actual_malicious_ids) * 100
-                print(f"  Recall: {recall:.1f}% ({len(all_detected_malicious)}/{len(actual_malicious_ids)} malicious clients detected)")
-            else:
-                print(f"  Recall: N/A (no malicious clients)")
+        # Averages
+        test_accs = [r.get('test_accuracy', 0.0) for r in self.round_history]
+        test_losses = [r.get('test_loss', np.inf) for r in self.round_history]
+        final_acc = test_accs[-1] if test_accs else 0.0
+        best_acc = max(test_accs) if test_accs else 0.0
+        best_round = test_accs.index(best_acc) + 1 if test_accs else 0
 
-            # Get full metrics including TP, TN, FP, FN
-            full_metrics = self.get_committee_metrics()
+        print(f"  Final TestAcc: {final_acc*100:.2f}%  |  Best TestAcc: {best_acc*100:.2f}% (R{best_round})")
 
-            # Overall rates
-            print(f"  Detection Rate: {self.committee_metrics['detection_rate']:.2%}")
-            print(f"  False Positive Rate: {self.committee_metrics['false_positive_rate']:.2%}")
-            print(f"  False Negative Rate: {full_metrics['false_negative_rate']:.2f}%")
-            print(f"  Precision: {full_metrics['precision']:.2f}%")
-            print(f"  Recall: {full_metrics['recall']:.2f}%")
+        if has_detection:
+            rounds_with_det = [r['detection_metrics'] for r in self.round_history if r.get('detection_metrics')]
+            if rounds_with_det:
+                avg_prec = np.mean([d['precision'] for d in rounds_with_det])
+                avg_rec = np.mean([d['recall'] for d in rounds_with_det])
+                avg_fpr = np.mean([d['fpr'] for d in rounds_with_det])
+                avg_f1 = np.mean([d['f1_score'] for d in rounds_with_det])
+                total_tp = sum(d['tp'] for d in rounds_with_det)
+                total_fp = sum(d['fp'] for d in rounds_with_det)
+                total_tn = sum(d['tn'] for d in rounds_with_det)
+                total_fn = sum(d['fn'] for d in rounds_with_det)
+                print(f"  Avg Detection: Prec={avg_prec:.1f}% Rec={avg_rec:.1f}% FPR={avg_fpr:.1f}% F1={avg_f1:.1f}%")
+                print(f"  Total Counts:  TP={total_tp} FP={total_fp} TN={total_tn} FN={total_fn}")
 
-            # Confusion Matrix Elements
-            print(f"\n  Confusion Matrix:")
-            print(f"    True Positives (TP):  {full_metrics['true_positives']}")
-            print(f"    True Negatives (TN):  {full_metrics['true_negatives']}")
-            print(f"    False Positives (FP): {full_metrics['false_positives']}")
-            print(f"    False Negatives (FN): {full_metrics['false_negatives']}")
+        total_time = self.cumulative_times[-1] if self.cumulative_times else 0.0
+        print(f"  Total Time: {total_time:.1f}s ({total_time/60:.1f}min)")
+        print("=" * 100 + "\n")
 
     def get_timing_data(self):
         """
@@ -533,89 +549,61 @@ class DecentralizedFLCoordinator:
 
     def get_committee_metrics(self):
         """
-        Get committee defense performance metrics for evaluation.
+        Get detection metrics computed per-round from round_history.
 
-        Uses MICRO-AVERAGED metrics (sum per-round TP/FP/TN/FN counts).
-        This is the standard FL approach and avoids the inflation problem of
-        cumulative "EVER detected" logic, where client rotation over many
-        rounds causes nearly every client to be flagged at least once.
-
-        Returns:
-            Dictionary containing detection_rate, false_positive_rate, TP, TN, FP, FN, and raw counts
+        Returns the LAST round's detection metrics for final reporting,
+        plus averaged metrics across all rounds.
         """
-        if self.use_defense and self.defense is not None:
-            try:
-                # Micro-averaged: sum per-round confusion matrix counts
-                metrics = self.defense.get_micro_averaged_detection_metrics(self.clients)
+        rounds_with_det = [
+            r['detection_metrics'] for r in self.round_history
+            if r.get('detection_metrics') is not None
+        ]
 
-                # Extract malicious IDs for backward compatibility
-                malicious_ids = set([c.client_id for c in self.clients if c.is_malicious])
-
-                return {
-                    'detection_rate': metrics['recall'],
-                    'false_positive_rate': metrics['fpr'],
-                    'false_negative_rate': metrics['fnr'],
-                    'precision': metrics['precision'],
-                    'recall': metrics['recall'],
-                    'f1_score': metrics['f1_score'],
-                    'accuracy': metrics['dacc'],
-                    'true_positives': metrics['tp_count'],
-                    'true_negatives': metrics['tn_count'],
-                    'false_positives': metrics['fp_count'],
-                    'false_negatives': metrics['fn_count'],
-                    'detected_malicious': metrics['tp_count'],
-                    'actual_malicious': list(malicious_ids),
-                    'total_clients': len(self.clients),
-                    'num_malicious': metrics['total_malicious_seen'],
-                    'num_benign': metrics['total_benign_seen'],
-                    'total_unique_participants': metrics['total_unique_participants'],
-                    'aggregation_method': metrics['aggregation_method']
-                }
-            except Exception as e:
-                print(f"[WARN] Failed to get micro-averaged metrics from defense: {e}")
-                pass
-
-        # LEGACY FALLBACK: Only used if defense is not available or metrics call fails
-        print("[WARN] Using legacy metrics calculation (not participant-based)")
-
-        malicious_ids = set([c.client_id for c in self.clients if c.is_malicious])
+        malicious_ids = set(c.client_id for c in self.clients if c.is_malicious)
         num_malicious = len(malicious_ids)
         num_benign = len(self.clients) - num_malicious
 
-        total_detected_malicious = 0
-        total_false_positives = 0
+        if not rounds_with_det:
+            return {
+                'detection_rate': 0.0, 'false_positive_rate': 0.0,
+                'false_negative_rate': 0.0, 'precision': 0.0, 'recall': 0.0,
+                'f1_score': 0.0, 'accuracy': 0.0,
+                'true_positives': 0, 'true_negatives': 0,
+                'false_positives': 0, 'false_negatives': 0,
+                'detected_malicious': 0, 'actual_malicious': list(malicious_ids),
+                'total_clients': len(self.clients),
+                'num_malicious': num_malicious, 'num_benign': num_benign,
+            }
 
-        for round_info in self.round_history:
-            detected_set = set(round_info.get('anomalous_clients', []))
-            total_detected_malicious += len(detected_set & malicious_ids)
-            total_false_positives += len(detected_set - malicious_ids)
-
-        true_positives = total_detected_malicious
-        false_positives = total_false_positives
-        false_negatives = num_malicious - true_positives
-        true_negatives = num_benign - false_positives
-
-        detection_rate = (true_positives / num_malicious * 100) if num_malicious > 0 else 0.0
-        false_positive_rate = (false_positives / num_benign * 100) if num_benign > 0 else 0.0
-        false_negative_rate = (false_negatives / num_malicious * 100) if num_malicious > 0 else 0.0
-        precision = (true_positives / (true_positives + false_positives) * 100) if (true_positives + false_positives) > 0 else 0.0
-        recall = detection_rate
+        # Average across all rounds
+        avg_prec = np.mean([d['precision'] for d in rounds_with_det])
+        avg_rec = np.mean([d['recall'] for d in rounds_with_det])
+        avg_f1 = np.mean([d['f1_score'] for d in rounds_with_det])
+        avg_fpr = np.mean([d['fpr'] for d in rounds_with_det])
+        avg_fnr = np.mean([d['fnr'] for d in rounds_with_det])
+        avg_dacc = np.mean([d['dacc'] for d in rounds_with_det])
+        total_tp = sum(d['tp'] for d in rounds_with_det)
+        total_fp = sum(d['fp'] for d in rounds_with_det)
+        total_tn = sum(d['tn'] for d in rounds_with_det)
+        total_fn = sum(d['fn'] for d in rounds_with_det)
 
         return {
-            'detection_rate': detection_rate,
-            'false_positive_rate': false_positive_rate,
-            'false_negative_rate': false_negative_rate,
-            'precision': precision,
-            'recall': recall,
-            'true_positives': true_positives,
-            'true_negatives': true_negatives,
-            'false_positives': false_positives,
-            'false_negatives': false_negatives,
-            'detected_malicious': total_detected_malicious,
+            'detection_rate': avg_rec,
+            'false_positive_rate': avg_fpr,
+            'false_negative_rate': avg_fnr,
+            'precision': avg_prec,
+            'recall': avg_rec,
+            'f1_score': avg_f1,
+            'accuracy': avg_dacc,
+            'true_positives': total_tp,
+            'true_negatives': total_tn,
+            'false_positives': total_fp,
+            'false_negatives': total_fn,
+            'detected_malicious': total_tp,
             'actual_malicious': list(malicious_ids),
             'total_clients': len(self.clients),
             'num_malicious': num_malicious,
-            'num_benign': num_benign
+            'num_benign': num_benign,
         }
 
     def get_malicious_in_committee_metrics(self):

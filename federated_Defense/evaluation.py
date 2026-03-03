@@ -16,7 +16,6 @@ from models import FashionMNISTNet, CIFAR10Net, FEMNISTNet, EMNISTNet, Shakespea
 from datasets import load_fashion_mnist, load_cifar10, load_femnist, load_emnist, load_shakespeare, load_sentiment140, partition_dataset
 from client import DecentralizedClient
 from coordinator import DecentralizedFLCoordinator
-from checkpoints import CheckpointManager
 # from plots import PlottingEngine  # Imported only when generating plots
 
 
@@ -47,7 +46,6 @@ class EvaluationFramework:
         # Create folders
         self.plots_dir = os.path.join(self.base_run_dir, "plots")
         self.results_dir = os.path.join(self.base_run_dir, "results")
-        self.checkpoint_dir = os.path.join(self.base_run_dir, "checkpoints")
         os.makedirs(self.plots_dir, exist_ok=True)
         os.makedirs(self.results_dir, exist_ok=True)
 
@@ -57,12 +55,6 @@ class EvaluationFramework:
         # Plotter - Skip initialization during evaluation for faster execution
         # self.plotter = PlottingEngine(output_dir=self.plots_dir, run_id=self.run_id)
         self.plotter = None  # Will be initialized only when plotting is needed
-
-        # Checkpoint manager
-        self.checkpoint_manager = CheckpointManager(
-            checkpoint_dir=self.base_run_dir,
-            run_id=self.run_id
-        )
 
         # Storage
         self.results = {}
@@ -261,12 +253,11 @@ class EvaluationFramework:
 
     def run_and_evaluate_coordinator(
         self, clients, rounds, test_loader,
-        test_X=None, y_test=None, use_defense=False, defense_type='adaptivecommittee',
+        test_X=None, y_test=None, use_defense=False, defense_type='cmfl',
         start_round=0, dataset="", attack="", scenario="", aggregation_method='fedavg'
     ):
         """
         Run federated learning for multiple rounds and evaluate on test data after each round.
-        Save checkpoint after completing all rounds.
 
         Args:
             aggregation_method: Aggregation method ('fedavg', 'krum', 'median', 'trimmed_mean')
@@ -292,7 +283,7 @@ class EvaluationFramework:
             coordinator = DecentralizedFLCoordinator(
                 clients,
                 use_defense=False,
-                defense_type=None,  # CRITICAL: Must be None to avoid default 'adaptivecommittee'
+                defense_type=None,  # Must be None to skip committee defense
                 aggregation_method=aggregation_method,
                 clients_per_round=20  # Fixed: 20 clients per round for baseline/attack
             )
@@ -326,7 +317,8 @@ class EvaluationFramework:
                 print(f"{'='*80}")
 
                 # Run a single round of federated learning with proper round numbering
-                coordinator.run_federated_learning(rounds=1, round_offset=round_num - 1, total_rounds=rounds)
+                coordinator.run_federated_learning(rounds=1, round_offset=round_num - 1, total_rounds=rounds,
+                                                   test_loader=test_loader)
 
                 # Evaluate at intervals and on the last round
                 if round_num % eval_interval == 0 or round_num == rounds:
@@ -446,34 +438,8 @@ class EvaluationFramework:
                             and getattr(coordinator.clients[cid], 'is_malicious', False)
                         )
 
-                        # Per-round (final round) metrics - DEPRECATED, use cumulative instead
-                        detection_metrics = {
-                            'detection_rate': (true_positives / num_malicious_participants * 100) if num_malicious_participants > 0 else 0.0,
-                            'false_positive_rate': (false_positives / num_benign_participants * 100) if num_benign_participants > 0 else 0.0,
-                            'precision': (true_positives / num_detected * 100) if num_detected > 0 else 0.0,
-                            'recall': (true_positives / num_malicious_participants * 100) if num_malicious_participants > 0 else 0.0,
-                            'actual_malicious_participants': num_malicious_participants,
-                            'actual_benign_participants': num_benign_participants,
-                            'total_participants': len(participating_clients),
-                            'total_clients': len(coordinator.clients),
-                            'detected_count': num_detected,
-                            'true_positives': true_positives,
-                            'false_positives': false_positives
-                        }
-
-                        # RECOMMENDED: Get cumulative metrics across all rounds
-                        if hasattr(defense, 'get_cumulative_detection_metrics'):
-                            cumulative_metrics = defense.get_cumulative_detection_metrics(coordinator.clients)
-                            # Add cumulative metrics with 'cumulative_' prefix
-                            for key, value in cumulative_metrics.items():
-                                if key != 'aggregation_method':
-                                    detection_metrics[f'cumulative_{key}'] = value
-                            # Override main metrics with cumulative (RECOMMENDED for FL)
-                            detection_metrics['precision'] = cumulative_metrics.get('precision', detection_metrics['precision'])
-                            detection_metrics['recall'] = cumulative_metrics.get('recall', detection_metrics['recall'])
-                            detection_metrics['detection_rate'] = cumulative_metrics.get('detection_rate', detection_metrics['detection_rate'])
-                            detection_metrics['dacc'] = cumulative_metrics.get('dacc', 0.0)
-                            detection_metrics['f1_score'] = cumulative_metrics.get('f1_score', 0.0)
+                        # Use coordinator's per-round averaged metrics
+                        detection_metrics = coordinator.get_committee_metrics()
             except Exception as e:
                 print(f"[WARN] Failed to extract detection metrics: {e}")
 
@@ -528,7 +494,7 @@ class EvaluationFramework:
     # Core experiments
     # ------------------------------
 
-    def run_comprehensive_evaluation(self, test_defenses=True, subset_fraction=0.25, resume=False, defenses_to_test=None):
+    def run_comprehensive_evaluation(self, test_defenses=True, subset_fraction=0.25, defenses_to_test=None):
         """
         Run comprehensive evaluation with proper history storage.
 
@@ -654,7 +620,7 @@ class EvaluationFramework:
 
                 # STEP 3: Test all defenses on the SAME attack scenario (deep copy for each defense)
                 if attack_name.lower() != 'none':
-                    defenses_to_run = ["adaptivecommittee", "cmfl"]
+                    defenses_to_run = ["cmfl"]
                     for defense_name in defenses_to_run:
                         print(f"\n[SCENARIO] Running DEFENSE ({defense_name.upper()}) for {attack_name}")
                         print(f"[INFO] Using deep copy of the SAME poisoned clients for fair comparison")
@@ -911,7 +877,6 @@ def run_enhanced_evaluation(
     out_dir="Output",
     test_defenses=True,
     subset_fraction=0.25,
-    resume=False,
     defenses_to_test=None
 ):
     """
@@ -923,20 +888,18 @@ def run_enhanced_evaluation(
         out_dir: Output directory
         test_defenses: Whether to test defenses
         subset_fraction: Fraction of dataset to use
-        resume: Whether to resume from checkpoint
-        defenses_to_test: List of defense types to test (default: ["adaptivecommittee", "cmfl"])
+        defenses_to_test: List of defense types to test (default: ["cmfl"])
 
     Returns:
         Tuple of (results dict, report statistics dict)
     """
 
     if defenses_to_test is None:
-        defenses_to_test = ["adaptivecommittee", "cmfl"]
+        defenses_to_test = ["cmfl"]
 
     print("=" * 100)
     print("ENHANCED DECENTRALIZED FEDERATED LEARNING SECURITY FRAMEWORK")
     print(f"Dataset Size: {subset_fraction * 100:.0f}% (for faster testing)")
-    print(f"Resume Mode: {'ENABLED' if resume else 'DISABLED'}")
     print("=" * 100)
 
     try:
@@ -946,33 +909,13 @@ def run_enhanced_evaluation(
             results = evaluator.load_results_from_json(resume_from_json)
             print("[INFO] Skipping training, reusing saved results.")
         else:
-            if resume:
-                # Search for any checkpoint files recursively in out_dir/checkpoints/
-                checkpoint_base = os.path.join(out_dir, "checkpoints")
-                found_checkpoint = False
-                for root, dirs, files in os.walk(checkpoint_base):
-                    for file in files:
-                        if file.endswith(".pth"):
-                            found_checkpoint = True
-                            break
-                    if found_checkpoint:
-                        break
-                if found_checkpoint:
-                    run_id = os.path.basename(os.path.normpath(out_dir))
-                    print(f"[INFO] Found checkpoint for run_id: {run_id}")
-                else:
-                    print("[INFO] No existing checkpoint found. Starting fresh...")
-                    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-            else:
-                run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
             evaluator = EvaluationFramework(out_dir=out_dir, run_id=run_id)
 
-            # Run main comprehensive evaluation with resume support
+            # Run main comprehensive evaluation
             results = evaluator.run_comprehensive_evaluation(
                 test_defenses=test_defenses,
                 subset_fraction=subset_fraction,
-                resume=resume,
                 defenses_to_test=defenses_to_test
             )
 
@@ -980,15 +923,6 @@ def run_enhanced_evaluation(
             table_data = evaluator.generate_results_table(results)
             evaluator.save_results_table_to_csv(table_data)
             evaluator.save_results_summary_to_json(results)
-            
-            # Print checkpoint info
-            print(f"\n{'='*80}")
-            print("CHECKPOINT SUMMARY")
-            print(f"{'='*80}")
-            print(f"Checkpoint directory: {evaluator.checkpoint_dir}")
-            print(f"Best checkpoints saved for each scenario")
-            print(f"To resume training: python main.py --resume")
-            print(f"{'='*80}")
 
         # Generate final report and print summary
         report_stats = evaluator.generate_comprehensive_report(results)
@@ -1007,12 +941,10 @@ def run_enhanced_evaluation(
 
     except KeyboardInterrupt:
         print("\n\n[INTERRUPTED] Training interrupted by user")
-        print("[INFO] Progress has been saved. You can resume using --resume flag")
         raise
     except Exception as e:
         print(f"\nError during evaluation: {str(e)}")
         traceback.print_exc()
-        print("\n[INFO] If training was interrupted, you can resume using --resume flag")
         raise
 
 
@@ -1125,11 +1057,9 @@ def run_attack_comparison_test(subset_fraction=0.25, num_clients=25, rounds = 5,
     return comparison_results
 
 
-def run_comprehensive_defense_test(subset_fraction=0.25, num_clients=25, rounds = 5, out_dir="comprehensive_defense_results",
-                                   resume_checkpoint=False, checkpoint_interval=2):
+def run_comprehensive_defense_test(subset_fraction=0.25, num_clients=25, rounds=5, out_dir="comprehensive_defense_results"):
     """
-    Comprehensive test of ALL committee-based defenses against ALL attacks for ALL datasets.
-    Tests adaptivecommittee and cmfl defenses separately (both distributed).
+    Comprehensive test of CMFL defense against ALL attacks for ALL datasets.
     Generates comparative visualizations and recovery rate analysis.
 
     Args:
@@ -1137,72 +1067,22 @@ def run_comprehensive_defense_test(subset_fraction=0.25, num_clients=25, rounds 
         num_clients: Number of clients in federated learning
         rounds: Number of FL rounds
         out_dir: Output directory for results
-        resume_checkpoint: If True, check for and resume from existing checkpoints
-        checkpoint_interval: Save checkpoint every N rounds
 
     Returns:
         Complete results dictionary with all defense comparisons
     """
     print("\n" + "="*100)
     print("COMPREHENSIVE DEFENSE TESTING FRAMEWORK")
-    print(f"Testing ALL 2 committee-based defenses (adaptivecommittee, cmfl) against ALL attacks")
+    print(f"Testing CMFL committee-based defense against ALL attacks")
     print(f"Dataset fraction: {subset_fraction*100:.0f}%, Clients: {num_clients}, Rounds: {rounds}")
-    if resume_checkpoint:
-        print(f"Checkpoint Resume: ENABLED (interval: every {checkpoint_interval} rounds)")
     print("="*100)
 
-    should_resume = False
-
-    if resume_checkpoint:
-        # Search for any checkpoint files recursively in out_dir/checkpoints/
-        checkpoint_base = os.path.join(out_dir, "checkpoints")
-        found_checkpoint = False
-        for root, dirs, files in os.walk(checkpoint_base):
-            for file in files:
-                if file.endswith(".pth"):
-                    found_checkpoint = True
-                    break
-            if found_checkpoint:
-                break
-        if found_checkpoint:
-            run_id = os.path.basename(os.path.normpath(out_dir))
-            print(f"[INFO] Found checkpoint for run_id: {run_id}")
-        else:
-            print("[INFO] No existing checkpoint found. Starting fresh...")
-            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    else:
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     framework = EvaluationFramework(out_dir=out_dir, run_id=run_id)
-
-    # Check for existing checkpoints if resume is enabled
-    if resume_checkpoint:
-        resume_info = framework.checkpoint_manager.get_resume_info()
-        if resume_info["can_resume"]:
-            print("\n" + "="*100)
-            print("[CHECKPOINT DETECTED]")
-            print("="*100)
-            print(f"  Last run was interrupted at:")
-            print(f"  Dataset: {resume_info['dataset']}")
-            print(f"  Attack: {resume_info['attack']}")
-            print(f"  Scenario: {resume_info['scenario']}")
-            print(f"  Last completed round: {resume_info['last_round']}/{rounds}")
-            print(f"  Completed scenarios: {resume_info['completed_scenarios']}")
-            print("="*100)
-
-            # NON-INTERACTIVE: Always resume if resume_checkpoint is set
-            should_resume = True
-            print("\n[RESUME] Resuming from checkpoint...")
-        else:
-            print("\n[INFO] No existing checkpoint found. Starting fresh...")
-            should_resume = False
-
-    # Store checkpoint interval for use in run_and_evaluate_coordinator
-    framework.checkpoint_interval = checkpoint_interval
 
     # Defense types to test - ALL 2 committee-based defenses
     # Only distributed committee-based defenses (centralized defenses removed)
-    defense_types = ['adaptivecommittee', 'cmfl']
+    defense_types = ['cmfl']
 
     # Get datasets and models
     datasets, models = framework.get_datasets_and_models()
@@ -1274,30 +1154,15 @@ def run_comprehensive_defense_test(subset_fraction=0.25, num_clients=25, rounds 
         bl_test_acc_history = []
         bl_test_loss_history = []
 
-        if should_resume and framework.checkpoint_manager.is_scenario_complete(dataset_name, 'baseline', baseline_scenario):
-            print(f"[SKIP] Baseline already completed - loading from checkpoint")
-            checkpoint = framework.checkpoint_manager.load_checkpoint(dataset_name, 'baseline', baseline_scenario, "best")
-            if checkpoint and 'metrics' in checkpoint:
-                baseline_acc = checkpoint['metrics'].get('accuracy', None)
-                # Try to load history from checkpoint if available
-                bl_training_acc_history = checkpoint['metrics'].get('training_acc_history', [])
-                bl_training_loss_history = checkpoint['metrics'].get('training_loss_history', [])
-                bl_test_acc_history = checkpoint['metrics'].get('test_acc_history', [])
-                bl_test_loss_history = checkpoint['metrics'].get('test_loss_history', [])
-                if baseline_acc is not None:
-                    print(f"Loaded baseline accuracy: {baseline_acc:.4f}")
-                else:
-                    print("Loaded baseline accuracy: None")
-        else:
-            print(f"[INFO] Running baseline (clean training, no attack, no defense)...")
-            baseline_clients = framework.build_clients(num_clients, client_data, models, dataset_name, attack_config=None, fixed_malicious_ids=fixed_malicious_ids)
-            _, _, baseline_acc, baseline_asr_list, bl_training_acc_history, bl_training_loss_history, bl_test_acc_history, bl_test_loss_history, _, _ = framework.run_and_evaluate_coordinator(
-                baseline_clients, rounds, test_loader, test_X=test_X, y_test=y_test,
-                use_defense=False, dataset=dataset_name, attack='baseline', scenario=baseline_scenario
-            )
-            print(f"✓ Baseline accuracy: {baseline_acc:.4f}")
-            print(f"[HISTORY] Collected {len(bl_training_acc_history)} rounds of training history")
-            print(f"[HISTORY] Collected {len(bl_test_acc_history)} rounds of test history")
+        print(f"[INFO] Running baseline (clean training, no attack, no defense)...")
+        baseline_clients = framework.build_clients(num_clients, client_data, models, dataset_name, attack_config=None, fixed_malicious_ids=fixed_malicious_ids)
+        _, _, baseline_acc, baseline_asr_list, bl_training_acc_history, bl_training_loss_history, bl_test_acc_history, bl_test_loss_history, _, _ = framework.run_and_evaluate_coordinator(
+            baseline_clients, rounds, test_loader, test_X=test_X, y_test=y_test,
+            use_defense=False, dataset=dataset_name, attack='baseline', scenario=baseline_scenario
+        )
+        print(f"✓ Baseline accuracy: {baseline_acc:.4f}")
+        print(f"[HISTORY] Collected {len(bl_training_acc_history)} rounds of training history")
+        print(f"[HISTORY] Collected {len(bl_test_acc_history)} rounds of test history")
         # ============================================================================
         # STEP 2: Test each REAL ATTACK with all defenses
         # ============================================================================
@@ -1344,58 +1209,31 @@ def run_comprehensive_defense_test(subset_fraction=0.25, num_clients=25, rounds 
 
             # 1. Run attack WITHOUT defense
             scenario_name = "attack"
-            start_round = 0
-            if should_resume and framework.checkpoint_manager.is_scenario_complete(dataset_name, attack_name, scenario_name):
-                print(f"\n[1/{len(defense_types)+1}] Attack (no defense) - SKIPPED (already completed)")
-                checkpoint = framework.checkpoint_manager.load_checkpoint(dataset_name, attack_name, scenario_name, "best")
-                if checkpoint and 'metrics' in checkpoint:
-                    attack_results['attack'] = checkpoint['metrics']
-                start_round = checkpoint.get('round', 0) + 1
-            else:
-                print(f"\n[1/{len(defense_types)+1}] {attack_name.upper()} attack (no defense)...")
-                attack_clients = framework.build_clients(num_clients, client_data, models, dataset_name, attack_config, fixed_malicious_ids=fixed_malicious_ids)
-                attack_coord, attack_result, attack_acc, attack_asr_list, training_acc_history, training_loss_history, test_acc_history, test_loss_history, _, _ = framework.run_and_evaluate_coordinator(
-                    attack_clients, rounds, test_loader, test_X=test_X, y_test=y_test,
-                    use_defense=False, dataset=dataset_name, attack=attack_name, scenario=scenario_name
-                )
+            print(f"\n[1/{len(defense_types)+1}] {attack_name.upper()} attack (no defense)...")
+            attack_clients = framework.build_clients(num_clients, client_data, models, dataset_name, attack_config, fixed_malicious_ids=fixed_malicious_ids)
+            attack_coord, attack_result, attack_acc, attack_asr_list, training_acc_history, training_loss_history, test_acc_history, test_loss_history, _, _ = framework.run_and_evaluate_coordinator(
+                attack_clients, rounds, test_loader, test_X=test_X, y_test=y_test,
+                use_defense=False, dataset=dataset_name, attack=attack_name, scenario=scenario_name
+            )
 
-                attack_asr = np.mean([r for r in attack_asr_list if r > 0]) if any(r > 0 for r in attack_asr_list) else 0.0
-                attack_results['attack'] = {
-                    'final_accuracy': float(attack_acc),
-                    'accuracy': float(attack_acc),
-                    'attack_success_rate': float(attack_asr),
-                    'training_acc_history': [float(x) for x in training_acc_history],
-                    'training_loss_history': [float(x) for x in training_loss_history],
-                    'test_acc_history': [float(x) for x in test_acc_history],
-                    'test_loss_history': [float(x) for x in test_loss_history],
-                    'attack_success_rates': [float(x) for x in attack_asr_list] if attack_asr_list else []
-                }
-                print(f"Attack accuracy: {attack_acc:.4f}, ASR: {attack_asr:.4f}")
-                print(f"[HISTORY] Collected {len(training_acc_history)} rounds of training history")
-                print(f"[HISTORY] Collected {len(test_acc_history)} rounds of test history")
+            attack_asr = np.mean([r for r in attack_asr_list if r > 0]) if any(r > 0 for r in attack_asr_list) else 0.0
+            attack_results['attack'] = {
+                'final_accuracy': float(attack_acc),
+                'accuracy': float(attack_acc),
+                'attack_success_rate': float(attack_asr),
+                'training_acc_history': [float(x) for x in training_acc_history],
+                'training_loss_history': [float(x) for x in training_loss_history],
+                'test_acc_history': [float(x) for x in test_acc_history],
+                'test_loss_history': [float(x) for x in test_loss_history],
+                'attack_success_rates': [float(x) for x in attack_asr_list] if attack_asr_list else []
+            }
+            print(f"Attack accuracy: {attack_acc:.4f}, ASR: {attack_asr:.4f}")
+            print(f"[HISTORY] Collected {len(training_acc_history)} rounds of training history")
+            print(f"[HISTORY] Collected {len(test_acc_history)} rounds of test history")
 
             # Test each defense type
-            print(f"\n[DEBUG] Starting defense loop for attack '{attack_name}'")
-            print(f"[DEBUG] Defense types to test: {defense_types}")
-            print(f"[DEBUG] Resume mode: {should_resume}")
-
             for idx, defense_type in enumerate(defense_types, start=2):
                 scenario_name = f"defense_{defense_type}"
-                start_round = 0
-                print(f"\n[DEBUG] Processing defense {idx-1}/{len(defense_types)}: {defense_type}")
-
-                # Check if scenario is already completed
-                is_completed = should_resume and framework.checkpoint_manager.is_scenario_complete(dataset_name, attack_name, scenario_name)
-                print(f"[DEBUG] Scenario '{scenario_name}' is_completed: {is_completed}")
-
-                if is_completed:
-                    print(f"\n[{idx}/{len(defense_types)+1}] {defense_type.upper()} defense - SKIPPED (already completed)")
-                    checkpoint = framework.checkpoint_manager.load_checkpoint(dataset_name, attack_name, scenario_name, "best")
-                    if checkpoint and 'metrics' in checkpoint:
-                        attack_results[defense_type] = checkpoint['metrics']
-                    start_round = checkpoint.get('round', 0) + 1
-                    continue
-
                 print(f"\n[{idx}/{len(defense_types)+1}] {attack_name.upper()} with {defense_type.upper()} defense...")
 
                 defense_clients = framework.build_clients(num_clients, client_data, models, dataset_name, attack_config, fixed_malicious_ids=fixed_malicious_ids)

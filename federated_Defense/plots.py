@@ -481,7 +481,7 @@ class PlottingEngine:
         """
         try:
             dataset_results = results.get(dataset_name, {})
-            defense_types = ['adaptivecommittee', 'cmfl']
+            defense_types = ['cmfl']
             attacks = [atk for atk in dataset_results.keys() if atk.lower() != 'none']
             
             if not attacks:
@@ -500,7 +500,6 @@ class PlottingEngine:
             }
             
             defense_colors = {
-                'adaptivecommittee': '#4169E1',  # Royal Blue
                 'cmfl': '#FF8C00'  # Dark Orange
             }
 
@@ -564,7 +563,7 @@ class PlottingEngine:
         """
         try:
             dataset_results = results.get(dataset_name, {})
-            defense_types = ['adaptivecommittee', 'cmfl']
+            defense_types = ['cmfl']
             attacks = [atk for atk in dataset_results.keys() if atk.lower() != 'none']
             
             if not attacks:
@@ -574,7 +573,6 @@ class PlottingEngine:
             fig, ax = plt.subplots(figsize=(14, 7))
             
             defense_colors = {
-                'adaptivecommittee': '#4169E1',  # Royal Blue
                 'cmfl': '#FF8C00'  # Dark Orange
             }
             
@@ -652,7 +650,7 @@ class PlottingEngine:
                 print(f"  [ERROR] TACC comparison failed: {e}")
             
             # Plot confusion matrices for each attack and defense
-            defense_types = ['adaptivecommittee', 'cmfl']
+            defense_types = ['cmfl']
             attacks = [atk for atk in dataset_results.keys() if atk.lower() != 'none']
             
             for attack_name in attacks:
@@ -674,9 +672,8 @@ class PlottingEngine:
         Each subplot shows baseline, attack, and all committee-based defenses.
         Supports up to 12 attacks with 3x4 grid layout.
         """
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
 
@@ -738,9 +735,8 @@ class PlottingEngine:
         Each subplot shows baseline, attack, and all committee-based defenses.
         Supports up to 10 attacks with 2x5 grid layout.
         """
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
 
@@ -798,9 +794,8 @@ class PlottingEngine:
         Each subplot shows baseline, attack, and all committee-based defenses.
         Supports up to 10 attacks with 2x5 grid layout.
         """
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
 
@@ -859,9 +854,8 @@ class PlottingEngine:
         Each subplot shows baseline, attack, and all committee-based defenses.
         Supports up to 10 attacks with 2x5 grid layout.
         """
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
 
@@ -919,9 +913,8 @@ class PlottingEngine:
         Each subplot shows train/test for baseline, attack, and all committee-based defenses.
         Supports up to 10 attacks with 2x5 grid layout.
         """
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
 
@@ -992,9 +985,8 @@ class PlottingEngine:
         Each subplot shows train/test for baseline, attack, and all committee-based defenses.
         Supports up to 10 attacks with 2x5 grid layout.
         """
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
 
@@ -1064,9 +1056,8 @@ class PlottingEngine:
         Each subplot shows convergence for baseline, attack, and all committee-based defenses.
         Supports up to 10 attacks with 2x5 grid layout.
         """
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
 
@@ -1137,12 +1128,12 @@ class PlottingEngine:
             defense_accs = []
             recovery_rates = []
 
-            # Collect data for adaptive committee defense across attacks
+            # Collect data for CMFL defense across attacks
             for attack_name, defenses in summary.items():
-                if not defenses or 'adaptivecommittee' not in defenses:
+                if not defenses or 'cmfl' not in defenses:
                     continue
 
-                metrics = defenses['adaptivecommittee']
+                metrics = defenses['cmfl']
                 clean_acc = metrics.get("clean_accuracy", 0.0) or 0.0
                 attack_acc = metrics.get("attack_accuracy", 0.0) or 0.0
                 defense_acc = metrics.get("defense_accuracy", 0.0) or 0.0
@@ -1233,9 +1224,8 @@ class PlottingEngine:
                        # Model poisoning attacks — commented out (redundant; uncomment if needed)
                        # 'local_model_replacement', 'local_model_noise', 'global_model_replacement', 'aggregation_modification',
                        ]
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
 
@@ -1292,11 +1282,10 @@ class PlottingEngine:
     def plot_all_defense_performance(self, results):
         """
         Plot defense performance metrics across attacks - SEPARATE plot for EACH dataset.
-        Shows all 2 committee-based defenses: adaptivecommittee, cmfl.
+        Shows CMFL committee-based defense.
         """
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
 
@@ -1388,9 +1377,8 @@ class PlottingEngine:
 
     def plot_attack_comparison(self, results):
         """Plot attack accuracy comparison for each dataset, including all committee-based defenses."""
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
         for dataset_name, dataset_results in results.items():
@@ -1446,9 +1434,8 @@ class PlottingEngine:
 
     def plot_attack_evaluation(self, results):
         """Bar chart of attack evaluation results with all committee-based defenses."""
-        defense_types = ['adaptivecommittee', 'cmfl']
+        defense_types = ['cmfl']
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
         for dataset_name, dataset_results in results.items():
@@ -1611,7 +1598,6 @@ class PlottingEngine:
         to avoid KeyErrors, while maintaining full visual structure.
         """
         defense_colors = {
-            'adaptivecommittee': '#4169E1',  # Royal Blue
             'cmfl': '#FF8C00'  # Dark Orange
         }
 
@@ -1634,7 +1620,7 @@ class PlottingEngine:
             return
 
         results = filtered_results
-        all_defenses = ['adaptivecommittee', 'cmfl']
+        all_defenses = ['cmfl']
 
         # ✅ Plot 1: Defense Comparison by Dataset (Accuracy)
         for dataset_name, dataset_results in results.items():

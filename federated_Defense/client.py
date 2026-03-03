@@ -184,7 +184,7 @@ class DecentralizedClient:
     # -------------------------------------------------------------------------
     # Local training (uses self.X and self.y which are poisoned for malicious clients)
     # -------------------------------------------------------------------------
-    def local_training(self, epochs=5, lr=0.01, batch_size=None):
+    def local_training(self, epochs=1, lr=0.01, batch_size=None):
         """Perform local training and return model parameters.
 
         Optimisations:
@@ -265,13 +265,6 @@ class DecentralizedClient:
     def receive_peer_updates(self, peer_updates):
         """Receive and store updates from peers"""
         self.received_updates = peer_updates
-
-    def select_peers(self, all_clients, num_peers=2):
-        """Randomly select a subset of peers for gossip communication"""
-        available_peers = [c for c in all_clients if c.client_id != self.client_id]
-        selected = random.sample(available_peers, min(num_peers, len(available_peers)))
-        self.neighbor_ids = [p.client_id for p in selected]
-        return selected
 
     def send_model_to_peers(self):
         """Prepare local parameters for sending to peers"""
