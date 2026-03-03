@@ -467,35 +467,6 @@ class DecentralizedFLCoordinator:
         has_detection = any(r.get('detection_metrics') is not None for r in self.round_history)
 
         print("\n" + "=" * 100)
-        print("FINAL TRAINING SUMMARY")
-        print("=" * 100)
-
-        # Header
-        if has_detection:
-            print(f"{'Round':>5} | {'TestAcc':>8} | {'TestLoss':>9} | {'TrainLoss':>10} | "
-                  f"{'TP':>3} {'FP':>3} {'TN':>3} {'FN':>3} | "
-                  f"{'Prec%':>6} {'Rec%':>6} {'FPR%':>6} {'F1%':>6} {'DAcc%':>6}")
-            print("-" * 100)
-        else:
-            print(f"{'Round':>5} | {'TestAcc':>8} | {'TestLoss':>9} | {'TrainLoss':>10}")
-            print("-" * 50)
-
-        for r in self.round_history:
-            rnd = r['round']
-            tacc = r.get('test_accuracy', 0.0) * 100
-            tloss = r.get('test_loss', np.inf)
-            train_loss = r.get('avg_loss', np.inf)
-
-            if has_detection and r.get('detection_metrics'):
-                dm = r['detection_metrics']
-                print(f"{rnd:>5} | {tacc:>7.2f}% | {tloss:>9.4f} | {train_loss:>10.4f} | "
-                      f"{dm['tp']:>3} {dm['fp']:>3} {dm['tn']:>3} {dm['fn']:>3} | "
-                      f"{dm['precision']:>5.1f} {dm['recall']:>5.1f} "
-                      f"{dm['fpr']:>5.1f} {dm['f1_score']:>5.1f} {dm['dacc']:>5.1f}")
-            else:
-                print(f"{rnd:>5} | {tacc:>7.2f}% | {tloss:>9.4f} | {train_loss:>10.4f}")
-
-        print("=" * 100)
 
         # Averages
         test_accs = [r.get('test_accuracy', 0.0) for r in self.round_history]
