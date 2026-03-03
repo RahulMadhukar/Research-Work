@@ -49,7 +49,7 @@ def run_full_ablation_study(selected_datasets=None, selected_attacks=None):
         'FEMNIST': 100, 'Shakespeare': 143, 'Sentiment140': 772,
     }
     dataset_rounds = {
-        'FEMNIST': 600, 'Shakespeare': 500, 'Sentiment140': 1000,
+        'FEMNIST': 100, 'Shakespeare': 500, 'Sentiment140': 1000,
     }
     all_attacks = attacks_to_run
     all_schemes = ['fedavg', 'multi_krum', 'cmfl', 'cmfl_ii']
