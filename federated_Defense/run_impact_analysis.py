@@ -639,7 +639,7 @@ ALL_ATTACKS            = BYZANTINE_ATTACKS  # Paper: only Byzantine attacks
 
 # Paper-exact round counts per dataset (arXiv:2108.00365v2)
 DATASET_ROUNDS = {'FEMNIST': 600, 'Shakespeare': 500, 'Sentiment140': 1000}
-DATASET_LR = {'FEMNIST': 0.01, 'Sentiment140': 0.005, 'Shakespeare': 0.001}
+DATASET_LR = {'FEMNIST': 0.001, 'Sentiment140': 0.005, 'Shakespeare': 0.001}
 DATASET_BATCH_SIZE = {'FEMNIST': 32, 'Sentiment140': 32, 'Shakespeare': 32}
 
 
