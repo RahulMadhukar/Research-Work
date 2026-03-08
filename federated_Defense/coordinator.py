@@ -3,6 +3,7 @@ import numpy as np
 from typing import List
 from collections import defaultdict
 from defense import CMFLDefense
+from cd_cfl_defense import CDCFLDefense
 
 
 class DecentralizedFLCoordinator:
@@ -51,7 +52,25 @@ class DecentralizedFLCoordinator:
         self.use_anomaly_detection = use_anomaly_detection
 
         # Initialize committee structure (ALWAYS if defense_type specified)
-        if defense_type and defense_type != 'none':
+        if defense_type in ('cd_cfl', 'cdcfl_ii'):
+            self.defense = CDCFLDefense(
+                num_clients=len(clients),
+                robust_agg_method=aggregation_method,
+                **defense_kwargs
+            )
+            self.defense_type = 'cdcfl_ii'  # normalize alias
+            self.committee_defense = None
+        elif defense_type == 'cdcfl_i':
+            fin_method = defense_kwargs.pop('finalization_method', 'pow')
+            self.defense = CDCFLDefense(
+                num_clients=len(clients),
+                robust_agg_method=aggregation_method,
+                finalization_method=fin_method,
+                **defense_kwargs
+            )
+            self.defense_type = 'cdcfl_i'
+            self.committee_defense = None
+        elif defense_type and defense_type != 'none':
             self.defense = CMFLDefense(
                 num_clients=len(clients),
                 aggregation_method=aggregation_method,
@@ -138,7 +157,7 @@ class DecentralizedFLCoordinator:
                           or current_round % 10 == 0)
 
             # --- Client selection ---
-            if self.defense and self.defense_type == 'cmfl':
+            if self.defense and self.defense_type in ('cdcfl_ii', 'cdcfl_i', 'cmfl'):
                 training_client_ids = self.defense.activate_training_clients()
                 active_client_ids = training_client_ids + list(self.defense.committee_members)
             else:
@@ -172,6 +191,17 @@ class DecentralizedFLCoordinator:
                         except Exception as e:
                             print(f"  [ERROR] Client {client_id}: Attack setup failed - {e}")
 
+            # --- Loss BEFORE training (for CDCFL-II PoW check only) ---
+            losses_before = {}
+            if self.defense_type == 'cdcfl_ii':
+                # Only CDCFL-II needs loss_before for PoW pre-filter
+                for cid in active_client_ids:
+                    try:
+                        losses_before[cid] = self.clients[cid].compute_loss_only()
+                    except Exception:
+                        losses_before[cid] = 0.0
+                # CDCFL-I skips this — no PoW pre-filter, saves one forward pass per client
+
             # --- Local training ---
             local_updates = []
             client_losses = []
@@ -183,7 +213,7 @@ class DecentralizedFLCoordinator:
                 client = self.clients[client_id]
                 params, loss, acc = client.local_training(epochs=self._epochs, lr=self._lr, batch_size=self._batch_size)
 
-                if self.defense and self.defense_type == 'cmfl':
+                if self.defense and self.defense_type in ('cmfl', 'cdcfl_ii', 'cdcfl_i'):
                     client_id_to_update[client_id] = params
                 else:
                     local_updates.append(params)
@@ -224,7 +254,37 @@ class DecentralizedFLCoordinator:
             if self.defense:
                 malicious_ids_for_diagnostics = list(malicious_ids) if malicious_ids else None
 
-                if self.defense_type == 'cmfl':
+                if self.defense_type == 'cdcfl_ii':
+                    client_losses_dict = {cid: client_losses[i] for i, cid in enumerate(active_client_ids)}
+                    global_params, anomalous_clients, defense_metrics = self.defense.cd_cfl_round(
+                        client_id_to_update,
+                        client_losses_before=losses_before,
+                        client_losses_after=client_losses_dict,
+                        malicious_client_ids=malicious_ids_for_diagnostics,
+                        all_clients=self.clients,
+                        client_data_sizes=client_data_sizes,
+                        use_anomaly_detection=self.use_anomaly_detection,
+                        global_params=self._global_params,
+                    )
+                    self.enhanced_metrics['defense_stats'].append(defense_metrics)
+
+                elif self.defense_type == 'cdcfl_i':
+                    client_losses_dict = {cid: client_losses[i] for i, cid in enumerate(active_client_ids)}
+                    global_params, anomalous_clients, defense_metrics = self.defense.cdcfl_i_round(
+                        client_updates=client_id_to_update,
+                        client_losses_after=client_losses_dict,
+                        malicious_client_ids=malicious_ids_for_diagnostics,
+                        all_clients=self.clients,
+                        client_data_sizes=client_data_sizes,
+                        global_params=self._global_params,
+                        use_anomaly_detection=self.use_anomaly_detection,
+                    )
+                    # Handle round rejection (consensus failed)
+                    if not defense_metrics.get('round_accepted', True):
+                        global_params = self._global_params
+                    self.enhanced_metrics['defense_stats'].append(defense_metrics)
+
+                elif self.defense_type == 'cmfl':
                     client_losses_dict = {cid: client_losses[i] for i, cid in enumerate(active_client_ids)}
                     global_params, anomalous_clients, defense_metrics = self.defense.cmfl_round(
                         client_id_to_update, client_losses_dict,
@@ -294,28 +354,43 @@ class DecentralizedFLCoordinator:
                 mal_in_round = participating & actual_set
                 benign_in_round = participating - actual_set
 
-                tp = len(mal_in_round & detected_set)
-                fp = len(benign_in_round & detected_set)
-                fn = len(mal_in_round - detected_set)
-                tn = len(benign_in_round - detected_set)
-                total_p = tp + fp + fn + tn
+                if self.defense_type == 'cdcfl_i':
+                    # CDCFL-I: no per-client detection, report round-level metrics
+                    round_detection = {
+                        'tp': 0, 'fp': 0, 'tn': len(benign_in_round), 'fn': len(mal_in_round),
+                        'precision': 0.0, 'recall': 0.0, 'f1_score': 0.0,
+                        'fpr': 0.0, 'fnr': 100.0, 'dacc': 0.0,
+                        'num_participants': len(participating),
+                        'num_malicious': len(mal_in_round),
+                        'num_benign': len(benign_in_round),
+                        'flagged': [],
+                        'strategy': 'CDCFL-I',
+                        'round_accepted': defense_metrics.get('round_accepted', True),
+                        'consensus_approval': defense_metrics.get('consensus_metrics', {}).get('approve_count', 0),
+                    }
+                else:
+                    tp = len(mal_in_round & detected_set)
+                    fp = len(benign_in_round & detected_set)
+                    fn = len(mal_in_round - detected_set)
+                    tn = len(benign_in_round - detected_set)
+                    total_p = tp + fp + fn + tn
 
-                precision = (tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
-                recall = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
-                f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-                fpr_val = (fp / (fp + tn) * 100) if (fp + tn) > 0 else 0.0
-                fnr_val = 100.0 - recall
-                dacc = ((tp + tn) / total_p * 100) if total_p > 0 else 0.0
+                    precision = (tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
+                    recall = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
+                    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+                    fpr_val = (fp / (fp + tn) * 100) if (fp + tn) > 0 else 0.0
+                    fnr_val = 100.0 - recall
+                    dacc = ((tp + tn) / total_p * 100) if total_p > 0 else 0.0
 
-                round_detection = {
-                    'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
-                    'precision': precision, 'recall': recall,
-                    'f1_score': f1, 'fpr': fpr_val, 'fnr': fnr_val, 'dacc': dacc,
-                    'num_participants': len(participating),
-                    'num_malicious': len(mal_in_round),
-                    'num_benign': len(benign_in_round),
-                    'flagged': sorted(list(detected_set)),
-                }
+                    round_detection = {
+                        'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
+                        'precision': precision, 'recall': recall,
+                        'f1_score': f1, 'fpr': fpr_val, 'fnr': fnr_val, 'dacc': dacc,
+                        'num_participants': len(participating),
+                        'num_malicious': len(mal_in_round),
+                        'num_benign': len(benign_in_round),
+                        'flagged': sorted(list(detected_set)),
+                    }
 
             # --- Track performance ---
             if valid_loss_clients:
@@ -359,7 +434,8 @@ class DecentralizedFLCoordinator:
                       f"TN={round_detection['tn']} FN={round_detection['fn']} "
                       f"Prec={round_detection['precision']:.1f}% "
                       f"Rec={round_detection['recall']:.1f}% "
-                      f"FPR={round_detection['fpr']:.1f}%")
+                      f"FPR={round_detection['fpr']:.1f}% "
+                      f"FNR={round_detection['fnr']:.1f}%")
             else:
                 print()
 
@@ -483,17 +559,17 @@ class DecentralizedFLCoordinator:
                 avg_prec = np.mean([d['precision'] for d in rounds_with_det])
                 avg_rec = np.mean([d['recall'] for d in rounds_with_det])
                 avg_fpr = np.mean([d['fpr'] for d in rounds_with_det])
+                avg_fnr = np.mean([d['fnr'] for d in rounds_with_det])
                 avg_f1 = np.mean([d['f1_score'] for d in rounds_with_det])
                 total_tp = sum(d['tp'] for d in rounds_with_det)
                 total_fp = sum(d['fp'] for d in rounds_with_det)
                 total_tn = sum(d['tn'] for d in rounds_with_det)
                 total_fn = sum(d['fn'] for d in rounds_with_det)
-                print(f"  Avg Detection: Prec={avg_prec:.1f}% Rec={avg_rec:.1f}% FPR={avg_fpr:.1f}% F1={avg_f1:.1f}%")
+                print(f"  Avg Detection: Prec={avg_prec:.1f}% Rec={avg_rec:.1f}% FPR={avg_fpr:.1f}% FNR={avg_fnr:.1f}% F1={avg_f1:.1f}%")
                 print(f"  Total Counts:  TP={total_tp} FP={total_fp} TN={total_tn} FN={total_fn}")
 
         total_time = self.cumulative_times[-1] if self.cumulative_times else 0.0
         print(f"  Total Time: {total_time:.1f}s ({total_time/60:.1f}min)")
-        print("=" * 100 + "\n")
 
     def get_timing_data(self):
         """
@@ -578,15 +654,47 @@ class DecentralizedFLCoordinator:
         }
 
     def get_malicious_in_committee_metrics(self):
-        """Get malicious-in-committee tracking from CMFL defense.
+        """Get N1/N2/N3 infiltration tracking from CMFL defense.
 
         Returns:
-            dict with per-round history and aggregate statistics,
+            dict with per-round history and aggregate statistics for
+            N1 (training), N2 (committee), N3 (aggregation),
             or empty dict if defense doesn't support this tracking.
         """
-        if (self.use_defense and self.defense is not None
-                and hasattr(self.defense, 'get_malicious_in_committee_summary')):
-            return self.defense.get_malicious_in_committee_summary()
+        if self.use_defense and self.defense is not None:
+            if hasattr(self.defense, 'get_infiltration_summary'):
+                return self.defense.get_infiltration_summary()
+            if hasattr(self.defense, 'get_malicious_in_committee_summary'):
+                return self.defense.get_malicious_in_committee_summary()
+        return {}
+
+    def get_defense_layer_metrics(self):
+        """Get CD-CFL layer-specific metrics (PoW rejections, timing).
+
+        Returns dict with pow/filter rejection totals and per-layer timing,
+        or empty dict if defense is not CD-CFL.
+        """
+        if self.defense is not None and hasattr(self.defense, 'get_layer_metrics'):
+            layer_metrics = self.defense.get_layer_metrics()
+            # Also extract per-layer timing from enhanced_metrics
+            defense_stats = self.enhanced_metrics.get('defense_stats', [])
+            pow_times = []
+            filter_times = []
+            agg_times = []
+            for ds in defense_stats:
+                lt = ds.get('layer_timing', {})
+                if lt:
+                    pow_times.append(lt.get('pow_time', 0.0))
+                    filter_times.append(lt.get('filter_time', 0.0))
+                    agg_times.append(lt.get('agg_time', 0.0))
+            if pow_times:
+                layer_metrics['avg_pow_time'] = float(np.mean(pow_times))
+                layer_metrics['avg_filter_time'] = float(np.mean(filter_times))
+                layer_metrics['avg_agg_time'] = float(np.mean(agg_times))
+                layer_metrics['total_pow_time'] = float(sum(pow_times))
+                layer_metrics['total_filter_time'] = float(sum(filter_times))
+                layer_metrics['total_agg_time'] = float(sum(agg_times))
+            return layer_metrics
         return {}
 
     def evaluate_on_test_set(self, test_loader):

@@ -141,7 +141,7 @@ def run_full_ablation_study(selected_datasets=None, selected_attacks=None):
                 client_participation=clients_per_round,
                 poison_percentage=0.4,
                 attacks_to_test=all_attacks,
-                committee_size_frac=0.40,
+                committee_size_frac=0.30,
                 aggregation_participation_frac=0.40,
                 dataset_fraction=dataset_fraction,
             )

@@ -81,9 +81,23 @@ def detect_ablation_type(json_path, results):
     elif 'non_iid' in path_str or 'noniid' in path_str:
         return 'non_iid'
 
+    elif 'efficiency' in path_str:
+        return 'efficiency'
+    elif 'committee' in path_str and 'malicious' in path_str:
+        return 'committee_malicious_tracking'
+    elif 'committee' in path_str:
+        return 'committee_size'
+    elif 'agg_participation' in path_str:
+        return 'agg_participation'
+
     # Try to detect from results structure
     if 'ablation_type' in results:
         return results['ablation_type']
+
+    # Detect efficiency from structure (dataset → rate keys like "1Mbps")
+    for key, val in results.items():
+        if isinstance(val, dict) and any(k.endswith('Mbps') for k in val):
+            return 'efficiency'
 
     return 'unknown'
 
@@ -575,6 +589,469 @@ def generate_plots(df, output_dir):
     print("[PLOTS] All plots generated successfully!\n")
 
 
+def extract_metrics_from_efficiency(results):
+    """Extract metrics from efficiency experiment results.
+
+    Efficiency JSON structure:
+        dataset -> {metadata, "1Mbps"/"10Mbps"/"100Mbps" -> framework -> metrics}
+
+    Returns a DataFrame with columns:
+        dataset, rate, framework, total_time, comm_overhead_mb, comp_time, accuracy
+    """
+    rows = []
+    _METADATA_KEYS = {
+        'model_size_bytes', 'rounds', 'total_clients', 'committee_size',
+        'training_clients', 'fl_total_comp_time', 'cmfl_total_comp_time',
+        'fl_accuracy', 'cmfl_accuracy',
+    }
+    _FRAMEWORK_LABELS = {
+        'typical_fl': 'Typical FL',
+        'braintorrent': 'BrainTorrent',
+        'gossipfl': 'GossipFL',
+        'cmfl': 'CMFL',
+    }
+
+    for dataset, ds_data in results.items():
+        if not isinstance(ds_data, dict):
+            continue
+
+        for key, val in ds_data.items():
+            if key in _METADATA_KEYS or not isinstance(val, dict):
+                continue
+            # key is a rate like "1Mbps", "10Mbps", "100Mbps"
+            rate = key
+            for fw_key, fw_data in val.items():
+                if not isinstance(fw_data, dict):
+                    continue
+                rows.append({
+                    'dataset': dataset,
+                    'rate': rate,
+                    'framework': _FRAMEWORK_LABELS.get(fw_key, fw_key),
+                    'total_time': fw_data.get('total_time', None),
+                    'comm_overhead_mb': fw_data.get('comm_overhead_bytes', 0) / (1024 ** 2),
+                    'comp_time': fw_data.get('comp_time', None),
+                    'accuracy': fw_data.get('accuracy', None),
+                })
+
+    df = pd.DataFrame(rows)
+    print(f"[DEBUG] Extracted {len(df)} efficiency rows")
+    if len(df) > 0:
+        print(f"[DEBUG] Datasets: {df['dataset'].unique().tolist()}")
+        print(f"[DEBUG] Rates: {df['rate'].unique().tolist()}")
+        print(f"[DEBUG] Frameworks: {df['framework'].unique().tolist()}")
+    return df
+
+
+def generate_efficiency_table(df, output_dir):
+    """Generate efficiency summary table (CSV + LaTeX + console)."""
+    print("\n" + "=" * 100)
+    print("GENERATING EFFICIENCY EXPERIMENT TABLE")
+    print("=" * 100)
+
+    rates = sorted(df['rate'].unique(), key=lambda r: float(r.replace('Mbps', '')))
+    frameworks = ['Typical FL', 'BrainTorrent', 'GossipFL', 'CMFL']
+    frameworks = [f for f in frameworks if f in df['framework'].values]
+
+    summary_rows = []
+    for dataset in df['dataset'].unique():
+        for fw in frameworks:
+            row = {'Dataset': dataset, 'Framework': fw}
+            for rate in rates:
+                sub = df[(df['dataset'] == dataset) & (df['framework'] == fw) & (df['rate'] == rate)]
+                if len(sub) > 0:
+                    m = sub.iloc[0]
+                    row[f'{rate}_Time'] = f"{m['total_time']:.1f}" if m['total_time'] is not None else "N/A"
+                    row[f'{rate}_Comm'] = f"{m['comm_overhead_mb']:.1f}" if m['comm_overhead_mb'] is not None else "N/A"
+                else:
+                    row[f'{rate}_Time'] = "N/A"
+                    row[f'{rate}_Comm'] = "N/A"
+            # Add accuracy (same across rates)
+            acc_sub = df[(df['dataset'] == dataset) & (df['framework'] == fw) & df['accuracy'].notna()]
+            row['Accuracy'] = f"{acc_sub.iloc[0]['accuracy']:.4f}" if len(acc_sub) > 0 else "N/A"
+            summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    # Save CSV
+    csv_path = output_dir / "efficiency_summary_table.csv"
+    summary_df.to_csv(csv_path, index=False)
+    print(f"[INFO] Efficiency table saved to: {csv_path}")
+
+    # Save LaTeX
+    latex_path = output_dir / "efficiency_summary_table.tex"
+    with open(latex_path, 'w') as f:
+        ncols = 2 + len(rates) * 2 + 1  # Dataset, Framework, (Time,Comm) per rate, Accuracy
+        f.write('\\begin{tabular}{ll' + 'rr' * len(rates) + 'r}\n\\hline\n')
+        h1 = ['Dataset', 'Framework']
+        for rate in rates:
+            h1.append(f'\\multicolumn{{2}}{{c}}{{{rate}}}')
+        h1.append('Accuracy')
+        f.write(' & '.join(h1) + ' \\\\\n')
+        h2 = ['', '']
+        for _ in rates:
+            h2.extend(['Time(s)', 'Comm(MB)'])
+        h2.append('')
+        f.write(' & '.join(h2) + ' \\\\\n\\hline\n')
+        for _, row in summary_df.iterrows():
+            parts = [str(row['Dataset']), str(row['Framework'])]
+            for rate in rates:
+                parts.append(str(row[f'{rate}_Time']))
+                parts.append(str(row[f'{rate}_Comm']))
+            parts.append(str(row['Accuracy']))
+            f.write(' & '.join(parts) + ' \\\\\n')
+        f.write('\\hline\n\\end{tabular}\n')
+    print(f"[INFO] LaTeX table saved to: {latex_path}")
+
+    # Console output
+    print("\n" + "=" * 120)
+    print("EFFICIENCY EXPERIMENT SUMMARY")
+    print("=" * 120)
+    header = f"{'Dataset':<15} {'Framework':<15}"
+    for rate in rates:
+        header += f" {'Time(s)':>10} {'Comm(MB)':>10}"
+    header += f" {'Accuracy':>10}"
+    print(header)
+    print("-" * 120)
+    for _, row in summary_df.iterrows():
+        line = f"{row['Dataset']:<15} {row['Framework']:<15}"
+        for rate in rates:
+            line += f" {row[f'{rate}_Time']:>10} {row[f'{rate}_Comm']:>10}"
+        line += f" {row['Accuracy']:>10}"
+        print(line)
+    print("=" * 120 + "\n")
+
+    return summary_df
+
+
+def generate_efficiency_plots(df, output_dir):
+    """Generate efficiency comparison plots."""
+    print("\n[PLOTS] Generating efficiency plots...")
+
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(exist_ok=True)
+
+    rates = sorted(df['rate'].unique(), key=lambda r: float(r.replace('Mbps', '')))
+    rate_values = [float(r.replace('Mbps', '')) for r in rates]
+    frameworks = ['Typical FL', 'BrainTorrent', 'GossipFL', 'CMFL']
+    frameworks = [f for f in frameworks if f in df['framework'].values]
+    datasets = df['dataset'].unique()
+
+    # 1. Total time vs transmission rate (one subplot per dataset)
+    n_ds = len(datasets)
+    fig, axes = plt.subplots(1, n_ds, figsize=(7 * n_ds, 5), squeeze=False)
+    fig.suptitle('Total Time vs Transmission Rate', fontsize=14, fontweight='bold')
+    for di, dataset in enumerate(datasets):
+        ax = axes[0, di]
+        for fw in frameworks:
+            sub = df[(df['dataset'] == dataset) & (df['framework'] == fw)]
+            times = []
+            for rate in rates:
+                r_sub = sub[sub['rate'] == rate]
+                times.append(r_sub.iloc[0]['total_time'] if len(r_sub) > 0 and r_sub.iloc[0]['total_time'] is not None else None)
+            valid = [(x, t) for x, t in zip(rate_values, times) if t is not None]
+            if valid:
+                xs, ys = zip(*valid)
+                ax.plot(xs, ys, marker='o', label=fw, linewidth=2)
+        ax.set_xlabel('Transmission Rate (Mbps)')
+        ax.set_ylabel('Total Time (s)')
+        ax.set_title(dataset, fontweight='bold')
+        ax.set_xscale('log')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(plots_dir / "efficiency_time_vs_rate.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved {plots_dir / 'efficiency_time_vs_rate.png'}")
+
+    # 2. Communication overhead bar chart
+    fig, axes = plt.subplots(1, n_ds, figsize=(7 * n_ds, 5), squeeze=False)
+    fig.suptitle('Communication Overhead by Framework', fontsize=14, fontweight='bold')
+    for di, dataset in enumerate(datasets):
+        ax = axes[0, di]
+        x = np.arange(len(rates))
+        width = 0.8 / len(frameworks)
+        for fi, fw in enumerate(frameworks):
+            comms = []
+            for rate in rates:
+                sub = df[(df['dataset'] == dataset) & (df['framework'] == fw) & (df['rate'] == rate)]
+                comms.append(sub.iloc[0]['comm_overhead_mb'] if len(sub) > 0 else 0)
+            ax.bar(x + fi * width, comms, width, label=fw)
+        ax.set_xlabel('Transmission Rate')
+        ax.set_ylabel('Communication Overhead (MB)')
+        ax.set_title(dataset, fontweight='bold')
+        ax.set_xticks(x + width * (len(frameworks) - 1) / 2)
+        ax.set_xticklabels(rates)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig(plots_dir / "efficiency_comm_overhead.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved {plots_dir / 'efficiency_comm_overhead.png'}")
+
+    print("[PLOTS] Efficiency plots generated successfully!\n")
+
+
+# =============================================================================
+# Committee Malicious Tracking (Section 6.6) — N1/N2/N3 infiltration
+# =============================================================================
+
+def extract_metrics_from_committee_tracking(results):
+    """Extract N1/N2/N3 infiltration metrics from committee tracking JSON.
+
+    Expected JSON structure:
+        epsilon% -> dataset -> attack -> scheme -> {committee_tracking: {avg_N1_count, ...}}
+
+    Returns a DataFrame with columns:
+        epsilon, dataset, attack, scheme, N1_avg, N1_frac, N2_avg, N2_frac, N3_avg, N3_frac,
+        accuracy, rounds_with_N2, rounds_with_N3
+    """
+    rows = []
+    for eps_key, eps_data in results.items():
+        if not isinstance(eps_data, dict):
+            continue
+        for dataset, ds_data in eps_data.items():
+            if not isinstance(ds_data, dict):
+                continue
+            for attack, atk_data in ds_data.items():
+                if not isinstance(atk_data, dict):
+                    continue
+                for scheme, sch_data in atk_data.items():
+                    if not isinstance(sch_data, dict):
+                        continue
+                    ct = sch_data.get('committee_tracking', {})
+                    atk_info = sch_data.get('attack', {})
+                    rows.append({
+                        'epsilon': eps_key,
+                        'dataset': dataset,
+                        'attack': attack,
+                        'scheme': scheme,
+                        'accuracy': atk_info.get('final_accuracy', None),
+                        'N1_avg': ct.get('avg_N1_count', 0.0),
+                        'N1_frac': ct.get('avg_N1_fraction', 0.0),
+                        'N2_avg': ct.get('avg_N2_count', ct.get('avg_malicious_count', 0.0)),
+                        'N2_frac': ct.get('avg_N2_fraction', ct.get('avg_malicious_fraction', 0.0)),
+                        'N3_avg': ct.get('avg_N3_count', 0.0),
+                        'N3_frac': ct.get('avg_N3_fraction', 0.0),
+                        'rounds_with_N2': ct.get('rounds_with_N2', ct.get('rounds_with_malicious', 0)),
+                        'rounds_with_N3': ct.get('rounds_with_N3', 0),
+                        'total_rounds': ct.get('total_rounds', 0),
+                    })
+
+    df = pd.DataFrame(rows)
+    print(f"[DEBUG] Committee tracking: extracted {len(df)} rows")
+    return df
+
+
+def generate_committee_tracking_table(df, output_dir):
+    """Generate CSV/LaTeX/console table showing avg N1/N2/N3 per epsilon."""
+    output_dir = Path(output_dir)
+    print("\n" + "=" * 100)
+    print("COMMITTEE MALICIOUS TRACKING TABLE (Section 6.6)")
+    print("=" * 100)
+
+    if len(df) == 0:
+        print("[WARN] No committee tracking data to tabulate.")
+        return
+
+    eps_values = sorted(df['epsilon'].unique(), key=lambda x: float(x.replace('%', '')))
+    datasets = sorted(df['dataset'].unique())
+    attacks = sorted(df['attack'].unique())
+    schemes = sorted(df['scheme'].unique())
+
+    summary_rows = []
+    for dataset in datasets:
+        for attack in attacks:
+            for scheme in schemes:
+                row = {'Dataset': dataset, 'Attack': attack, 'Scheme': scheme}
+                for eps in eps_values:
+                    sub = df[(df['dataset'] == dataset) & (df['attack'] == attack) &
+                             (df['scheme'] == scheme) & (df['epsilon'] == eps)]
+                    if len(sub) > 0:
+                        r = sub.iloc[0]
+                        row[f'{eps}_N1'] = f"{r['N1_avg']:.2f}"
+                        row[f'{eps}_N2'] = f"{r['N2_avg']:.2f}"
+                        row[f'{eps}_N3'] = f"{r['N3_avg']:.2f}"
+                        row[f'{eps}_Acc'] = f"{r['accuracy']:.3f}" if r['accuracy'] is not None else "N/A"
+                    else:
+                        row[f'{eps}_N1'] = "N/A"
+                        row[f'{eps}_N2'] = "N/A"
+                        row[f'{eps}_N3'] = "N/A"
+                        row[f'{eps}_Acc'] = "N/A"
+                summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    # Build ordered columns
+    id_cols = ['Dataset', 'Attack', 'Scheme']
+    ordered = list(id_cols)
+    for eps in eps_values:
+        ordered.extend([f'{eps}_N1', f'{eps}_N2', f'{eps}_N3', f'{eps}_Acc'])
+    summary_df = summary_df[[c for c in ordered if c in summary_df.columns]]
+
+    # Save CSV
+    csv_path = output_dir / "committee_tracking_table.csv"
+    with open(csv_path, 'w') as f:
+        h1 = list(id_cols)
+        for eps in eps_values:
+            h1.extend([f'ε={eps}', '', '', ''])
+        f.write(','.join(h1) + '\n')
+        h2 = [''] * len(id_cols)
+        for _ in eps_values:
+            h2.extend(['N1', 'N2', 'N3', 'Acc'])
+        f.write(','.join(h2) + '\n')
+        for _, row in summary_df.iterrows():
+            vals = [str(row.get(c, '')) for c in ordered if c in summary_df.columns]
+            f.write(','.join(vals) + '\n')
+    print(f"[INFO] CSV saved to: {csv_path}")
+
+    # Save LaTeX
+    latex_path = output_dir / "committee_tracking_table.tex"
+    with open(latex_path, 'w') as f:
+        col_spec = 'l' * len(id_cols) + 'r' * (len(eps_values) * 4)
+        f.write('\\begin{tabular}{' + col_spec + '}\n\\hline\n')
+        h1 = list(id_cols)
+        for eps in eps_values:
+            h1.append(f'\\multicolumn{{4}}{{c}}{{$\\varepsilon$={eps}}}')
+        f.write(' & '.join(h1) + ' \\\\\n')
+        h2 = [''] * len(id_cols)
+        for _ in eps_values:
+            h2.extend(['N1', 'N2', 'N3', 'Acc'])
+        f.write(' & '.join(h2) + ' \\\\\n\\hline\n')
+        for _, row in summary_df.iterrows():
+            parts = [str(row.get(c, '')) for c in ordered if c in summary_df.columns]
+            f.write(' & '.join(parts) + ' \\\\\n')
+        f.write('\\hline\n\\end{tabular}\n')
+    print(f"[INFO] LaTeX saved to: {latex_path}")
+
+    # Print to console
+    print("\n" + "-" * 120)
+    header = f"{'Dataset':<12} {'Attack':<18} {'Scheme':<10}"
+    for eps in eps_values:
+        header += f" | {eps:^24}"
+    print(header)
+    sub_header = f"{'':12} {'':18} {'':10}"
+    for _ in eps_values:
+        sub_header += f" | {'N1':>5} {'N2':>5} {'N3':>5}  {'Acc':>6}"
+    print(sub_header)
+    print("-" * 120)
+    for _, row in summary_df.iterrows():
+        line = f"{row.get('Dataset',''):<12} {row.get('Attack',''):<18} {row.get('Scheme',''):<10}"
+        for eps in eps_values:
+            n1 = row.get(f'{eps}_N1', 'N/A')
+            n2 = row.get(f'{eps}_N2', 'N/A')
+            n3 = row.get(f'{eps}_N3', 'N/A')
+            acc = row.get(f'{eps}_Acc', 'N/A')
+            line += f" | {n1:>5} {n2:>5} {n3:>5}  {acc:>6}"
+        print(line)
+    print("-" * 120)
+
+
+def generate_committee_tracking_plots(df, output_dir):
+    """Line plots of N1/N2/N3 counts vs epsilon."""
+    output_dir = Path(output_dir)
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    if len(df) == 0:
+        print("[WARN] No committee tracking data to plot.")
+        return
+
+    eps_values = sorted(df['epsilon'].unique(), key=lambda x: float(x.replace('%', '')))
+    eps_numeric = [float(e.replace('%', '')) for e in eps_values]
+    datasets = sorted(df['dataset'].unique())
+    schemes = sorted(df['scheme'].unique())
+    attacks = sorted(df['attack'].unique())
+
+    # One figure per dataset, subplots per attack
+    for dataset in datasets:
+        ds_df = df[df['dataset'] == dataset]
+        n_attacks = len(attacks)
+        if n_attacks == 0:
+            continue
+
+        fig, axes = plt.subplots(1, max(n_attacks, 1), figsize=(7 * n_attacks, 5), squeeze=False)
+        fig.suptitle(f'{dataset} — Malicious Infiltration vs ε', fontsize=14, fontweight='bold')
+
+        for ai, attack in enumerate(attacks):
+            ax = axes[0, ai]
+            for scheme in schemes:
+                sub = ds_df[(ds_df['attack'] == attack) & (ds_df['scheme'] == scheme)]
+                if len(sub) == 0:
+                    continue
+                # Align by epsilon order
+                n1s, n2s, n3s = [], [], []
+                for eps in eps_values:
+                    eps_sub = sub[sub['epsilon'] == eps]
+                    if len(eps_sub) > 0:
+                        n1s.append(eps_sub.iloc[0]['N1_avg'])
+                        n2s.append(eps_sub.iloc[0]['N2_avg'])
+                        n3s.append(eps_sub.iloc[0]['N3_avg'])
+                    else:
+                        n1s.append(0); n2s.append(0); n3s.append(0)
+
+                ls = '-' if 'II' not in scheme else '--'
+                ax.plot(eps_numeric, n1s, marker='o', linestyle=ls, label=f'{scheme} N1 (train)')
+                ax.plot(eps_numeric, n2s, marker='s', linestyle=ls, label=f'{scheme} N2 (comm.)')
+                ax.plot(eps_numeric, n3s, marker='^', linestyle=ls, label=f'{scheme} N3 (agg.)')
+
+            ax.set_xlabel('Malicious Ratio ε (%)')
+            ax.set_ylabel('Avg Malicious Count')
+            ax.set_title(attack.upper())
+            ax.legend(fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        fname = plots_dir / f"committee_tracking_{dataset.lower()}.png"
+        plt.savefig(fname, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved {fname}")
+
+    print("[PLOTS] Committee tracking plots generated successfully!\n")
+
+
+def generate_tables_and_plots(json_path):
+    """Programmatic entry point — called after each ablation saves its JSON.
+
+    Args:
+        json_path: Path (str or Path) to the results JSON file.
+    """
+    json_path = Path(json_path)
+    if not json_path.exists():
+        print(f"[WARN] Results file not found, skipping table generation: {json_path}")
+        return
+
+    results = load_ablation_results(json_path)
+    ablation_type = detect_ablation_type(json_path, results)
+    print(f"[INFO] Detected ablation type: {ablation_type}")
+
+    output_dir = json_path.parent
+
+    if ablation_type == 'efficiency':
+        df = extract_metrics_from_efficiency(results)
+        if len(df) == 0:
+            print("[WARN] No data extracted from efficiency results.")
+            return
+        generate_efficiency_table(df, output_dir)
+        generate_efficiency_plots(df, output_dir)
+    elif ablation_type == 'committee_malicious_tracking':
+        df = extract_metrics_from_committee_tracking(results)
+        if len(df) == 0:
+            print("[WARN] No data extracted from committee tracking results.")
+            return
+        generate_committee_tracking_table(df, output_dir)
+        generate_committee_tracking_plots(df, output_dir)
+    else:
+        df = extract_metrics_from_ablation(results)
+        if len(df) == 0:
+            print("[WARN] No data extracted from results file.")
+            return
+        generate_summary_table(df, output_dir, ablation_type)
+        generate_detection_metrics_table(df, output_dir, ablation_type)
+        generate_plots(df, output_dir)
+
+    print(f"[INFO] Tables and plots saved to: {output_dir}")
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python generate_ablation_tables.py <results_json_file>")
@@ -595,39 +1072,72 @@ def main():
     ablation_type = detect_ablation_type(json_path, results)
     print(f"[INFO] Detected ablation type: {ablation_type}")
 
-    # Extract metrics
-    df = extract_metrics_from_ablation(results)
-
-    if len(df) == 0:
-        print("[ERROR] No data extracted from results file. Check JSON structure.")
-        sys.exit(1)
-
     # Create output directory
     output_dir = json_path.parent
 
     print(f"\n[INFO] Generating tables and plots...")
     print(f"[INFO] Output directory: {output_dir}\n")
 
-    # Generate tables
-    summary_table = generate_summary_table(df, output_dir, ablation_type)
-    detection_table = generate_detection_metrics_table(df, output_dir, ablation_type)
+    if ablation_type == 'efficiency':
+        # Efficiency has a different JSON structure — use dedicated functions
+        df = extract_metrics_from_efficiency(results)
+        if len(df) == 0:
+            print("[ERROR] No data extracted from efficiency results. Check JSON structure.")
+            sys.exit(1)
+        generate_efficiency_table(df, output_dir)
+        generate_efficiency_plots(df, output_dir)
+        print("\n" + "=" * 100)
+        print("EFFICIENCY TABLE GENERATION COMPLETE")
+        print("=" * 100)
+        print(f"\nResults saved in: {output_dir}")
+        print(f"Plots saved in: {output_dir / 'plots'}")
+        print("\nFiles generated:")
+        print("  - efficiency_summary_table.csv/.tex")
+        print("  - efficiency_time_vs_rate.png")
+        print("  - efficiency_comm_overhead.png")
+        print("=" * 100 + "\n")
+    elif ablation_type == 'committee_malicious_tracking':
+        df = extract_metrics_from_committee_tracking(results)
+        if len(df) == 0:
+            print("[ERROR] No data extracted from committee tracking results. Check JSON structure.")
+            sys.exit(1)
+        generate_committee_tracking_table(df, output_dir)
+        generate_committee_tracking_plots(df, output_dir)
+        print("\n" + "=" * 100)
+        print("COMMITTEE TRACKING TABLE GENERATION COMPLETE")
+        print("=" * 100)
+        print(f"\nResults saved in: {output_dir}")
+        print(f"Plots saved in: {output_dir / 'plots'}")
+        print("\nFiles generated:")
+        print("  - committee_tracking_table.csv/.tex")
+        print("  - committee_tracking_<dataset>.png")
+        print("=" * 100 + "\n")
+    else:
+        # Standard ablation extraction
+        df = extract_metrics_from_ablation(results)
+        if len(df) == 0:
+            print("[ERROR] No data extracted from results file. Check JSON structure.")
+            sys.exit(1)
 
-    # Generate plots
-    generate_plots(df, output_dir)
+        # Generate tables
+        summary_table = generate_summary_table(df, output_dir, ablation_type)
+        detection_table = generate_detection_metrics_table(df, output_dir, ablation_type)
 
-    # Summary
-    print("\n" + "="*100)
-    print("✅ ABLATION STUDY TABLE GENERATION COMPLETE")
-    print("="*100)
-    print(f"\nResults saved in: {output_dir}")
-    print(f"Plots saved in: {output_dir / 'plots'}")
-    print("\nFiles generated:")
-    print("  - ablation_summary_table.csv/.tex")
-    print("  - detection_metrics_table.csv/.tex")
-    print("  - accuracy_vs_parameter.png")
-    print("  - asr_vs_parameter.png")
-    print("  - detection_metrics_vs_parameter.png")
-    print("="*100 + "\n")
+        # Generate plots
+        generate_plots(df, output_dir)
+
+        # Summary
+        print("\n" + "="*100)
+        print("ABLATION STUDY TABLE GENERATION COMPLETE")
+        print("="*100)
+        print(f"\nResults saved in: {output_dir}")
+        print(f"Plots saved in: {output_dir / 'plots'}")
+        print("\nFiles generated:")
+        print("  - ablation_summary_table.csv/.tex")
+        print("  - detection_metrics_table.csv/.tex")
+        print("  - accuracy_vs_parameter.png")
+        print("  - asr_vs_parameter.png")
+        print("=" * 100 + "\n")
 
 
 if __name__ == "__main__":

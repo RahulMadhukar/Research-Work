@@ -182,6 +182,24 @@ class DecentralizedClient:
         self._gpu_data_id = None
 
     # -------------------------------------------------------------------------
+    # Loss-only evaluation (for PoW loss-descent check)
+    # -------------------------------------------------------------------------
+    def compute_loss_only(self):
+        """Compute loss on local data WITHOUT training. For PoW loss-descent check."""
+        device = self._device
+        self.model.to(device)
+        self.model.eval()
+        data_id = (id(self.X), id(self.y), len(self.X))
+        if self._gpu_data_id != data_id or self._gpu_X is None:
+            self._gpu_X = torch.FloatTensor(self.X).to(device)
+            self._gpu_y = torch.LongTensor(self.y).to(device)
+            self._gpu_data_id = data_id
+        with torch.no_grad():
+            outputs = self.model(self._gpu_X)
+            loss = self._criterion(outputs, self._gpu_y)
+        return loss.item()
+
+    # -------------------------------------------------------------------------
     # Local training (uses self.X and self.y which are poisoned for malicious clients)
     # -------------------------------------------------------------------------
     def local_training(self, epochs=1, lr=0.01, batch_size=None):
@@ -205,7 +223,7 @@ class DecentralizedClient:
 
         # --- Tensor cache — avoids repeated CPU→GPU copies every round ---
         data_id = (id(self.X), id(self.y), len(self.X))
-        if self._gpu_data_id != data_id:
+        if self._gpu_data_id != data_id or self._gpu_dataset is None:
             self._gpu_X = torch.FloatTensor(self.X).to(device)
             self._gpu_y = torch.LongTensor(self.y).to(device)
             self._gpu_dataset = TensorDataset(self._gpu_X, self._gpu_y)
@@ -238,9 +256,6 @@ class DecentralizedClient:
                     epoch_loss += loss.item()
                 epoch_losses.append(epoch_loss / len(dataloader))
 
-        # NOTE: Local accuracy evaluation REMOVED for speed.  The per-client
-        # accuracy was only used for debug printing and is not part of the FL
-        # algorithm.  Returning 0.0 keeps the return signature unchanged.
         avg_loss = np.mean(epoch_losses)
 
         # Apply model-level poisoning AFTER training — only for attacks that need it
@@ -255,6 +270,13 @@ class DecentralizedClient:
                     self.model = self.attack_instance.poison_model(self.model)
                 except Exception as e:
                     print(f"  [ERROR] Client {self.client_id}: Model poisoning failed - {e}")
+
+            # Recompute loss on the POISONED model so PoW sees the real effect
+            self.model.eval()
+            with torch.no_grad():
+                outputs = self.model(self._gpu_X)
+                avg_loss = self._criterion(outputs, self._gpu_y).item()
+            self.model.train()
 
         params = {name: param.data.cpu().clone() for name, param in self.model.named_parameters()}
         return params, avg_loss, 0.0

@@ -568,8 +568,8 @@ class CMFLDefense:
         # Per-round detection tracking
         self.detection_history_per_round = []
 
-        # Per-round tracking of malicious clients in committee
-        self.malicious_in_committee_history = []
+        # Per-round infiltration tracking: N1 (training), N2 (committee), N3 (aggregation)
+        self.infiltration_history = []
 
         # Verbose logging: set to True for debug, False for speed
         self.verbose = False
@@ -805,21 +805,6 @@ class CMFLDefense:
         self.round_count += 1
         all_client_ids = sorted(client_updates.keys())
 
-        # Track malicious clients in committee this round
-        if all_clients is not None:
-            malicious_in_committee = [
-                cid for cid in self.committee_members
-                if cid < len(all_clients) and all_clients[cid].is_malicious
-            ]
-            self.malicious_in_committee_history.append({
-                'round': self.round_count,
-                'committee_members': sorted(self.committee_members),
-                'committee_size': len(self.committee_members),
-                'malicious_in_committee': sorted(malicious_in_committee),
-                'malicious_count': len(malicious_in_committee),
-                'malicious_fraction': len(malicious_in_committee) / max(1, len(self.committee_members)),
-            })
-
         # Step 1: Separate training vs committee updates
         training_ids = [cid for cid in all_client_ids if cid in self.training_clients]
         committee_ids = [cid for cid in all_client_ids if cid in self.committee_members]
@@ -833,34 +818,87 @@ class CMFLDefense:
                 training_updates, committee_updates_dict
             )
 
-            # Step 3: pBFT consensus with Selection Strategy I
-            selected_clients, flagged_clients = self.pbft_consensus(
+            # Step 3: pBFT consensus — α-based SELECTION for aggregation
+            selected_clients, selection_excluded = self.pbft_consensus(
                 final_scores, training_ids
             )
+
+            # Step 3b: Anomaly-based DETECTION (separate from aggregation selection)
+            # Uses L2 distances (inverse of P_k scores) with 2×median threshold.
+            # This decouples "who to exclude from aggregation" (α-based, always
+            # rejects 1-α fraction) from "who is statistically anomalous"
+            # (only flags true outliers with distance > 2× median).
+            #
+            # Why 2×median: robust to small sample sizes (6 training clients),
+            # 0% FP on honest rounds, catches same_value/back_gradient/gradient_scaling.
+            C = len(committee_ids)
+            eps = 1e-10
+            distances = {cid: C / (final_scores[cid] + eps) for cid in training_ids}
+            dist_values = np.array([distances[cid] for cid in training_ids])
+            if len(dist_values) >= 2:
+                median_dist = float(np.median(dist_values))
+                anomaly_threshold = 2.0 * median_dist
+                anomaly_detected = [cid for cid in training_ids
+                                    if distances[cid] > anomaly_threshold]
+            else:
+                anomaly_detected = []
+                anomaly_threshold = 0.0
+
         elif use_anomaly_detection and len(committee_ids) == 0:
             selected_clients = list(training_ids)
-            flagged_clients = []
+            selection_excluded = []
+            anomaly_detected = []
             final_scores = {cid: 1.0 for cid in training_ids}
+            anomaly_threshold = 0.0
         else:
             selected_clients = list(training_ids)
-            flagged_clients = []
+            selection_excluded = []
+            anomaly_detected = []
             final_scores = {}
+            anomaly_threshold = 0.0
 
-        # Track cumulative detected malicious
-        for cid in flagged_clients:
+        # Track N1/N2/N3 infiltration (after selected_clients is known)
+        if all_clients is not None:
+            mal_in_training = [cid for cid in training_ids
+                               if cid < len(all_clients) and all_clients[cid].is_malicious]
+            mal_in_committee = [cid for cid in self.committee_members
+                                if cid < len(all_clients) and all_clients[cid].is_malicious]
+            mal_in_aggregation = [cid for cid in selected_clients
+                                  if cid < len(all_clients) and all_clients[cid].is_malicious]
+            self.infiltration_history.append({
+                'round': self.round_count,
+                # N1: malicious in training set
+                'training_ids': sorted(training_ids),
+                'training_size': len(training_ids),
+                'N1_count': len(mal_in_training),
+                'N1_fraction': len(mal_in_training) / max(1, len(training_ids)),
+                # N2: malicious in committee
+                'committee_members': sorted(self.committee_members),
+                'committee_size': len(self.committee_members),
+                'N2_count': len(mal_in_committee),
+                'N2_fraction': len(mal_in_committee) / max(1, len(self.committee_members)),
+                # N3: malicious in aggregation set (selected by scoring)
+                'selected_clients': sorted(selected_clients),
+                'aggregation_size': len(selected_clients),
+                'N3_count': len(mal_in_aggregation),
+                'N3_fraction': len(mal_in_aggregation) / max(1, len(selected_clients)),
+            })
+
+        # Track cumulative detected malicious (anomaly-based, not α-based)
+        for cid in anomaly_detected:
             self.detected_malicious.add(cid)
 
         # Step 4: Aggregate selected clients (Eq. 5, data-size weighted)
-        # Include committee updates in the update pool so aggregation can access them if needed
+        # Aggregation uses α-based selected_clients (unchanged behavior)
         aggregated_params = self.aggregate_selected_clients(
             selected_clients, client_updates, client_data_sizes=client_data_sizes
         )
 
-        # Step 5: Detection metrics
+        # Step 5: Detection metrics (using anomaly-detected, not α-excluded)
         detection_metrics_dict = None
         if all_clients is not None and use_anomaly_detection:
             round_metrics = self.calculate_round_detection_metrics(
-                all_clients, round_num=self.round_count, flagged_this_round=flagged_clients
+                all_clients, round_num=self.round_count, flagged_this_round=anomaly_detected
             )
             detection_metrics_dict = round_metrics
 
@@ -889,50 +927,79 @@ class CMFLDefense:
             'training_clients': sorted(training_ids),
             'committee_members': sorted(list(self.committee_members)),
             'selected_clients': selected_clients,
-            'flagged_clients': flagged_clients,
+            'selection_excluded': selection_excluded,
+            'anomaly_detected': anomaly_detected,
             'aggregation_clients': selected_clients,
             'final_scores': final_scores,
-            'anomaly_threshold': self.aggregation_participation_frac
+            'anomaly_threshold': anomaly_threshold,
+            'aggregation_participation_frac': self.aggregation_participation_frac,
         }
 
         if detection_metrics_dict is not None:
             metrics['detection_metrics'] = detection_metrics_dict
 
-        return aggregated_params, flagged_clients, metrics
+        # Return anomaly_detected (not selection_excluded) for coordinator detection
+        return aggregated_params, anomaly_detected, metrics
 
-    def get_malicious_in_committee_summary(self):
-        """Summarize malicious-in-committee tracking across all rounds.
+    def get_infiltration_summary(self):
+        """Summarize N1/N2/N3 infiltration tracking across all rounds.
+
+        N1 = malicious in training set, N2 = malicious in committee,
+        N3 = malicious in aggregation set (selected by scoring).
 
         Returns:
-            dict with per-round history and aggregate statistics.
+            dict with per-round history and aggregate statistics for N1/N2/N3.
         """
-        history = self.malicious_in_committee_history
+        history = self.infiltration_history
+        empty = {
+            'per_round': [], 'total_rounds': 0,
+            'avg_N1_count': 0.0, 'avg_N1_fraction': 0.0,
+            'max_N1_count': 0, 'max_N1_fraction': 0.0,
+            'avg_N2_count': 0.0, 'avg_N2_fraction': 0.0,
+            'max_N2_count': 0, 'max_N2_fraction': 0.0,
+            'rounds_with_N2': 0, 'rounds_with_N2_fraction': 0.0,
+            'avg_N3_count': 0.0, 'avg_N3_fraction': 0.0,
+            'max_N3_count': 0, 'max_N3_fraction': 0.0,
+            'rounds_with_N3': 0, 'rounds_with_N3_fraction': 0.0,
+            # Backward-compatible aliases (N2)
+            'avg_malicious_count': 0.0, 'avg_malicious_fraction': 0.0,
+            'max_malicious_count': 0, 'max_malicious_fraction': 0.0,
+            'rounds_with_malicious': 0, 'rounds_with_malicious_fraction': 0.0,
+        }
         if not history:
+            return empty
+
+        def _stats(key_count, key_frac):
+            counts = [r[key_count] for r in history]
+            fracs = [r[key_frac] for r in history]
+            rw = sum(1 for c in counts if c > 0)
             return {
-                'per_round': [],
-                'total_rounds': 0,
-                'avg_malicious_count': 0.0,
-                'avg_malicious_fraction': 0.0,
-                'max_malicious_count': 0,
-                'max_malicious_fraction': 0.0,
-                'rounds_with_malicious': 0,
-                'rounds_with_malicious_fraction': 0.0,
+                f'avg_{key_count}': float(np.mean(counts)),
+                f'avg_{key_frac}': float(np.mean(fracs)),
+                f'max_{key_count}': int(max(counts)),
+                f'max_{key_frac}': float(max(fracs)),
+                f'rounds_with_{key_count.replace("_count", "")}': rw,
+                f'rounds_with_{key_count.replace("_count", "")}_fraction': rw / len(history),
             }
 
-        mal_counts = [r['malicious_count'] for r in history]
-        mal_fracs = [r['malicious_fraction'] for r in history]
-        rounds_with = sum(1 for c in mal_counts if c > 0)
+        result = {'per_round': history, 'total_rounds': len(history)}
+        result.update(_stats('N1_count', 'N1_fraction'))
+        result.update(_stats('N2_count', 'N2_fraction'))
+        result.update(_stats('N3_count', 'N3_fraction'))
 
-        return {
-            'per_round': history,
-            'total_rounds': len(history),
-            'avg_malicious_count': float(np.mean(mal_counts)),
-            'avg_malicious_fraction': float(np.mean(mal_fracs)),
-            'max_malicious_count': int(max(mal_counts)),
-            'max_malicious_fraction': float(max(mal_fracs)),
-            'rounds_with_malicious': rounds_with,
-            'rounds_with_malicious_fraction': rounds_with / len(history) if history else 0.0,
-        }
+        # Backward-compatible aliases (N2 = committee)
+        result['avg_malicious_count'] = result['avg_N2_count']
+        result['avg_malicious_fraction'] = result['avg_N2_fraction']
+        result['max_malicious_count'] = result['max_N2_count']
+        result['max_malicious_fraction'] = result['max_N2_fraction']
+        result['rounds_with_malicious'] = result['rounds_with_N2']
+        result['rounds_with_malicious_fraction'] = result['rounds_with_N2_fraction']
+
+        return result
+
+    def get_malicious_in_committee_summary(self):
+        """Backward-compatible alias for get_infiltration_summary()."""
+        return self.get_infiltration_summary()
 
     # =========================================================================
     # Detection Metric Methods (simple per-round)

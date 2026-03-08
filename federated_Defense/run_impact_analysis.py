@@ -45,6 +45,7 @@ from typing import List, Dict, Optional, Union
 
 # Import evaluation framework for proper client setup
 from evaluation import EvaluationFramework
+from generate_ablation_tables import generate_tables_and_plots
 
 
 # =============================================================================
@@ -87,7 +88,8 @@ def run_baseline_evaluation(
     committee_size_frac: float = 0.40,
     scoring_mode: str = 'distance_only',
     selection_strategy: int = 1,
-    lr: float = None
+    lr: float = None,
+    **defense_kwargs
 ):
     """
     Run baseline evaluation with clean data (NO attack, NO poisoning).
@@ -155,7 +157,7 @@ def run_baseline_evaluation(
     # ---------------------------------------------------------------------------
     # Create coordinator — respects committee schemes even on clean (baseline) data
     # ---------------------------------------------------------------------------
-    _COMMITTEE_SCHEMES = {'cmfl', 'cmfl_ii'}
+    _COMMITTEE_SCHEMES = {'cmfl', 'cmfl_ii', 'cd_cfl', 'cdcfl_i', 'cdcfl_ii'}
 
     # Dataset-specific learning rates and batch sizes
     if lr is None:
@@ -167,9 +169,13 @@ def run_baseline_evaluation(
         if aggregation.lower() == 'cmfl_ii':
             chosen_defense = 'cmfl'
             selection_strategy = 2
+        elif aggregation.lower() == 'cdcfl_i':
+            chosen_defense = 'cdcfl_i'
+        elif aggregation.lower() in ('cdcfl_ii', 'cd_cfl'):
+            chosen_defense = 'cdcfl_ii'
         else:
             chosen_defense = aggregation.lower()
-        base_agg         = 'weighted_avg'
+        base_agg = 'multi_krum' if chosen_defense in ('cdcfl_ii', 'cdcfl_i') else 'weighted_avg'
         committee_size   = max(2, int(clients_per_round * committee_size_frac))
         training_clients = max(4, clients_per_round - committee_size)
 
@@ -185,10 +191,13 @@ def run_baseline_evaluation(
             aggregation_participation_frac=aggregation_participation_frac,
             scoring_mode=scoring_mode,
             selection_strategy=selection_strategy,
-            lr=lr, batch_size=_bs
+            lr=lr, batch_size=_bs,
+            **defense_kwargs
         )
         strategy_label = "II" if selection_strategy == 2 else "I"
+        print("-" * 70)
         print(f"[INFO] Baseline ({chosen_defense.upper()}): committee={committee_size} ({committee_size_frac*100:.0f}%), training={training_clients}, Strategy {strategy_label}, detection=OFF (clean baseline), lr={lr}, batch_size={_bs}")
+        print("-" * 70)
     else:
         coordinator = DecentralizedFLCoordinator(
             clients,
@@ -198,7 +207,9 @@ def run_baseline_evaluation(
             clients_per_round=clients_per_round,
             lr=lr, batch_size=_bs
         )
+        print("-" * 70)
         print(f"[INFO] Baseline ({aggregation.upper()}): plain FL, {clients_per_round} clients/round")
+        print("-" * 70)
 
     # Track test accuracy and loss per round
     test_acc_history = []
@@ -353,7 +364,8 @@ def create_attack_scenario(
         attack_config = AttackConfig(
             attack_type=attack_type,
             num_malicious_clients=malicious_clients,
-            data_poisoning_rate=0.0
+            data_poisoning_rate=0.0,
+            epsilon=0.5
         )
     elif attack_type.lower() in ['same_value', 'back_gradient']:
         # Byzantine attacks: manipulate gradients, NOT data. data_poisoning_rate=0.
@@ -411,7 +423,8 @@ def test_defense_on_scenario(
     scoring_mode: str = 'distance_only',
     selection_strategy: int = 1,
     lr: float = 0.01,
-    batch_size: int = 32
+    batch_size: int = 32,
+    **defense_kwargs
 ):
     """
     Run one FL scenario (baseline or attack) under a given aggregation scheme.
@@ -431,7 +444,7 @@ def test_defense_on_scenario(
     import math
     from coordinator import DecentralizedFLCoordinator
 
-    _COMMITTEE_SCHEMES = {'cmfl', 'cmfl_ii'}
+    _COMMITTEE_SCHEMES = {'cmfl', 'cmfl_ii', 'cd_cfl', 'cdcfl_i', 'cdcfl_ii'}
 
     # Reset clients to their post-poisoning snapshot (no expensive deep copy)
     if hasattr(clients_list[0], '_snapshot_model_state'):
@@ -451,9 +464,13 @@ def test_defense_on_scenario(
         if aggregation.lower() == 'cmfl_ii':
             chosen_defense = 'cmfl'
             selection_strategy = 2
+        elif aggregation.lower() == 'cdcfl_i':
+            chosen_defense = 'cdcfl_i'
+        elif aggregation.lower() in ('cdcfl_ii', 'cd_cfl'):
+            chosen_defense = 'cdcfl_ii'
         else:
             chosen_defense = aggregation.lower()          # 'cmfl'
-        base_agg       = 'weighted_avg'               # data-size weighted averaging for committee schemes
+        base_agg = 'multi_krum' if chosen_defense in ('cdcfl_ii', 'cdcfl_i') else 'weighted_avg'
 
         if clients_per_round is not None:
             committee_size   = max(2, int(clients_per_round * committee_size_frac))
@@ -474,11 +491,15 @@ def test_defense_on_scenario(
             aggregation_participation_frac=aggregation_participation_frac,
             scoring_mode=scoring_mode,
             selection_strategy=selection_strategy,
-            lr=lr, batch_size=batch_size
+            lr=lr, batch_size=batch_size,
+            **defense_kwargs
         )
         strategy_label = "II" if selection_strategy == 2 else "I"
+        _extra = f", defense_kwargs={defense_kwargs}" if defense_kwargs else ""
+        print("-" * 70)
         print(f"[INFO] {chosen_defense.upper()} scheme: committee={committee_size or 'auto'} ({committee_size_frac*100:.0f}%), "
-              f"training={training_clients or 'auto'}, Strategy {strategy_label}, anomaly detection ON, scoring={scoring_mode}")
+              f"training={training_clients or 'auto'}, Strategy {strategy_label}, anomaly detection ON, scoring={scoring_mode}{_extra}")
+        print("-" * 70)
     else:
         # Plain aggregation — no committee, no anomaly detection
         coordinator = DecentralizedFLCoordinator(
@@ -489,7 +510,9 @@ def test_defense_on_scenario(
             clients_per_round=clients_per_round,
             lr=lr, batch_size=batch_size
         )
+        print("-" * 70)
         print(f"[INFO] {aggregation.upper()} scheme: plain FL, {clients_per_round or len(clients_copy)} clients/round")
+        print("-" * 70)
 
     # Track test accuracy and loss per round
     test_acc_history = []
@@ -595,6 +618,14 @@ def test_defense_on_scenario(
             print(f"[WARN] Failed to get detection metrics: {e}")
             detection_metrics = {}
 
+        # Merge CD-CFL layer metrics (PoW rejections, per-layer timing)
+        try:
+            layer_metrics = coordinator.get_defense_layer_metrics()
+            if layer_metrics:
+                detection_metrics.update(layer_metrics)
+        except Exception:
+            pass
+
     return final_accuracy, attack_success_rate, detection_metrics, test_acc_history, test_loss_history
 
 
@@ -618,7 +649,7 @@ def test_defense_on_scenario(
 
 # Canonical list of aggregation schemes (plain + committee).
 ALL_AGG_SCHEMES = ['fedavg', 'krum', 'multi_krum', 'median', 'trimmed_mean',
-                   'cmfl', 'cmfl_ii']
+                   'cmfl', 'cmfl_ii', 'cdcfl_ii']
 
 # ---------------------------------------------------------------------------
 # Attack categories — controls which attacks run in each ablation study.
@@ -960,6 +991,7 @@ def run_client_malicious_ratio_ablation(
         json.dump(results, f, indent=2)
 
     print(f"\n{'='*100}\n✅ Client malicious ratio ablation completed\nResults saved to: {results_file}\n{'='*100}")
+    generate_tables_and_plots(results_file)
     return results
 
 
@@ -1070,6 +1102,7 @@ def run_non_iid_ablation(
         json.dump(results, f, indent=2)
 
     print(f"\n{'='*100}\n✅ Non-IID ablation completed\nResults saved to: {results_file}\n{'='*100}")
+    generate_tables_and_plots(results_file)
     return results
 
 
@@ -1172,6 +1205,7 @@ def run_client_participation_ablation(
         json.dump(results, f, indent=2)
 
     print(f"\n{'='*100}\n✅ Client participation ablation completed\nResults saved to: {results_file}\n{'='*100}")
+    generate_tables_and_plots(results_file)
     return results
 
 
@@ -1280,6 +1314,7 @@ def run_aggregation_participation_ablation(
         json.dump(results, f, indent=2)
 
     print(f"\n{'='*100}\n✅ Aggregation participation ablation completed\nResults saved to: {results_file}\n{'='*100}")
+    generate_tables_and_plots(results_file)
     return results
 
 
@@ -1383,6 +1418,7 @@ def run_committee_size_ablation(
         json.dump(results, f, indent=2)
 
     print(f"\n{'='*100}\n✅ Committee size ablation completed\nResults saved to: {results_file}\n{'='*100}")
+    generate_tables_and_plots(results_file)
     return results
 
 
@@ -1399,25 +1435,20 @@ def run_committee_malicious_tracking_ablation(
     client_participation: int = 20,
     poison_percentage: float = 0.4,
     attacks_to_test: Optional[List[str]] = None,
-    committee_size_frac: float = 0.40,
+    committee_size_frac: float = 0.30,
     aggregation_participation_frac: float = 0.40,
     dataset_fraction: float = 1.0,
     run_id: str = None,
     selection_strategy: int = 1
 ):
-    """Ablation 7 — Committee member malicious tracking.
+    """Ablation 7 — Committee member malicious tracking (Paper Section 6.6).
 
-    Tracks how many malicious clients end up in the CMFL committee across
-    rounds as the malicious ratio varies.  This measures the defense's ability
-    to keep malicious clients OUT of the trusted validation committee.
+    Tracks malicious client infiltration into three client groups per round:
+      - N1: Malicious clients in the TRAINING set
+      - N2: Malicious clients in the COMMITTEE (validation group)
+      - N3: Malicious clients in the AGGREGATION set (selected by pBFT scoring)
 
-    For each malicious ratio, runs CMFL Strategy I and II with every attack
-    and records:
-      - Per-round committee composition and malicious overlap
-      - Aggregate stats: avg/max malicious fraction in committee
-      - Fraction of rounds where at least one malicious client is in committee
-      - Standard detection metrics and accuracy for context
-
+    Paper setup: alpha=40%, omega=30%, vary epsilon in {10,20,30,40,50}%.
     Only CMFL/CMFL_II schemes are tested (plain schemes have no committee).
     """
     import math
@@ -1583,15 +1614,23 @@ def run_committee_malicious_tracking_ablation(
                         per_round_summary = []
                         for r in committee_tracking.get('per_round', []):
                             per_round_summary.append({
-                                'round': r['round'],
-                                'committee_size': r['committee_size'],
-                                'malicious_count': r['malicious_count'],
-                                'malicious_fraction': r['malicious_fraction'],
+                                'round': r.get('round'),
+                                'training_size': r.get('training_size', 0),
+                                'committee_size': r.get('committee_size', 0),
+                                'aggregation_size': r.get('aggregation_size', 0),
+                                'N1_count': r.get('N1_count', 0),
+                                'N1_fraction': r.get('N1_fraction', 0.0),
+                                'N2_count': r.get('N2_count', 0),
+                                'N2_fraction': r.get('N2_fraction', 0.0),
+                                'N3_count': r.get('N3_count', 0),
+                                'N3_fraction': r.get('N3_fraction', 0.0),
                             })
 
+                        avg_n1 = committee_tracking.get('avg_N1_count', 0)
+                        avg_n2 = committee_tracking.get('avg_N2_count', committee_tracking.get('avg_malicious_count', 0))
+                        avg_n3 = committee_tracking.get('avg_N3_count', 0)
                         print(f"    [{scheme_key}] Acc={final_accuracy:.4f}, "
-                              f"Avg mal in committee={committee_tracking.get('avg_malicious_count', 0):.2f}/{cs}, "
-                              f"Rounds with mal={committee_tracking.get('rounds_with_malicious', 0)}/{_rounds}")
+                              f"Avg N1={avg_n1:.2f}/{tc}, N2={avg_n2:.2f}/{cs}, N3={avg_n3:.2f}")
 
                         dataset_attack_results[attack_type][scheme_key] = {
                             'baseline': {
@@ -1605,12 +1644,25 @@ def run_committee_malicious_tracking_ablation(
                             },
                             'committee_tracking': {
                                 'total_rounds': committee_tracking.get('total_rounds', 0),
-                                'avg_malicious_count': committee_tracking.get('avg_malicious_count', 0.0),
-                                'avg_malicious_fraction': committee_tracking.get('avg_malicious_fraction', 0.0),
-                                'max_malicious_count': committee_tracking.get('max_malicious_count', 0),
-                                'max_malicious_fraction': committee_tracking.get('max_malicious_fraction', 0.0),
-                                'rounds_with_malicious': committee_tracking.get('rounds_with_malicious', 0),
-                                'rounds_with_malicious_fraction': committee_tracking.get('rounds_with_malicious_fraction', 0.0),
+                                # N1 (training)
+                                'avg_N1_count': committee_tracking.get('avg_N1_count', 0.0),
+                                'avg_N1_fraction': committee_tracking.get('avg_N1_fraction', 0.0),
+                                'max_N1_count': committee_tracking.get('max_N1_count', 0),
+                                'max_N1_fraction': committee_tracking.get('max_N1_fraction', 0.0),
+                                # N2 (committee)
+                                'avg_N2_count': committee_tracking.get('avg_N2_count', committee_tracking.get('avg_malicious_count', 0.0)),
+                                'avg_N2_fraction': committee_tracking.get('avg_N2_fraction', committee_tracking.get('avg_malicious_fraction', 0.0)),
+                                'max_N2_count': committee_tracking.get('max_N2_count', committee_tracking.get('max_malicious_count', 0)),
+                                'max_N2_fraction': committee_tracking.get('max_N2_fraction', committee_tracking.get('max_malicious_fraction', 0.0)),
+                                'rounds_with_N2': committee_tracking.get('rounds_with_N2', committee_tracking.get('rounds_with_malicious', 0)),
+                                'rounds_with_N2_fraction': committee_tracking.get('rounds_with_N2_fraction', committee_tracking.get('rounds_with_malicious_fraction', 0.0)),
+                                # N3 (aggregation)
+                                'avg_N3_count': committee_tracking.get('avg_N3_count', 0.0),
+                                'avg_N3_fraction': committee_tracking.get('avg_N3_fraction', 0.0),
+                                'max_N3_count': committee_tracking.get('max_N3_count', 0),
+                                'max_N3_fraction': committee_tracking.get('max_N3_fraction', 0.0),
+                                'rounds_with_N3': committee_tracking.get('rounds_with_N3', 0),
+                                'rounds_with_N3_fraction': committee_tracking.get('rounds_with_N3_fraction', 0.0),
                                 'per_round': per_round_summary,
                             },
                         }
@@ -1638,6 +1690,7 @@ def run_committee_malicious_tracking_ablation(
     print(f"✅ Committee malicious tracking ablation completed")
     print(f"Results saved to: {results_file}")
     print(f"{'=' * 100}")
+    generate_tables_and_plots(results_file)
     return results
 
 
@@ -1931,6 +1984,7 @@ def run_efficiency_experiment(
     print(f"✅ Efficiency experiment completed")
     print(f"Results saved to: {results_file}")
     print(f"{'=' * 100}")
+    generate_tables_and_plots(results_file)
     return results
 
 
@@ -2152,10 +2206,8 @@ Examples:
             print("  - Output/ablation_committee_size/")
 
         print(f"\n{'='*100}")
-        print("Next steps:")
-        print("1. Use table_generator.py to create tables from results")
-        print("2. Use plot_tables.py to visualize the ablation study results")
-        print("3. Analyze impact of each parameter on defense performance")
+        print("Tables and plots have been auto-generated in each ablation's aggregated_results/ folder.")
+        print("To regenerate manually: python generate_ablation_tables.py <results_json_file>")
         print(f"{'='*100}\n")
 
 
