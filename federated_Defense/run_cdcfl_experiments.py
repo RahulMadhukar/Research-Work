@@ -46,13 +46,13 @@ from run_impact_analysis import (
 # =============================================================================
 DATASETS = ['FEMNIST', 'Shakespeare', 'Sentiment140']
 ATTACKS = ['gradient_scaling', 'same_value', 'back_gradient']
-ROUNDS = {'FEMNIST': 600, 'Shakespeare': 500, 'Sentiment140': 1000}
+ROUNDS = {'FEMNIST': 100, 'Shakespeare': 500, 'Sentiment140': 1000}
 LR = {'FEMNIST': 0.001, 'Shakespeare': 0.001, 'Sentiment140': 0.005}
 NUM_CLIENTS = 100
-DATASET_FRACTION = 0.25
+DATASET_FRACTION = 0.5
 EPS_DEFAULT = 0.1
 ALPHA = 0.4   # aggregation participation fraction
-OMEGA = 0.4   # committee size fraction
+OMEGA = 0.3   # committee size fraction
 OUTPUT_PREFIX = 'cd_cfl'  # output subdirectory (overridden by lightweight wrapper)
 
 # Dev mode overrides
