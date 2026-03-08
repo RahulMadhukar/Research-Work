@@ -13,7 +13,7 @@ Usage:
     python lightweight_test.py -e E2,E3 -d femnist      # E2+E3 on FEMNIST
 """
 
-import run_cd_cfl_experiments as exp
+import run_cdcfl_experiments as exp
 
 # Lightweight overrides
 exp.ROUNDS = {'FEMNIST': 100, 'Shakespeare': 100, 'Sentiment140': 100}
