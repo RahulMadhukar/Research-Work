@@ -124,15 +124,15 @@ class _ByzantineBase(BaseAttack):
 
 class GradientScalingAttack(_ByzantineBase):
     """
-    Gradient Scaling Attack  (CMFL paper Section 6.3.1).
+    Gradient Scaling Attack  (CMFL paper Section 6.3.1, enhanced).
 
-    The entire update is multiplied by a single random scalar
-    λ ∈ [a, 1).  The paper sets a = 0.5 so that λ ∈ [0.5, 1.0): malicious
-    clients send a *weakened* but correctly-directed update (direction
-    preserved, magnitude reduced).
+    Multi-mode attack that randomly selects between three strategies:
+      Mode 1 (40%): Negative scaling — partially reverses gradient direction
+      Mode 2 (40%): Amplification — overwhelms honest gradients in FedAvg
+      Mode 3 (20%): Original paper attenuation — weakened but correct direction
 
     Config:
-        epsilon  – explicit lower bound *a* (default 0.5, matching the paper).
+        epsilon  – scaling parameter *a* (default 0.5).
     """
 
     def __init__(self, config: AttackConfig):
@@ -140,8 +140,16 @@ class GradientScalingAttack(_ByzantineBase):
         self.a = config.epsilon if config.epsilon is not None else 0.5
 
     def _craft_update(self, update: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        # Paper: "a random value λ ∈ [a, 1)" — single scalar per client per round
-        lam = np.random.uniform(self.a, 1.0)
+        mode = np.random.random()
+        if mode < 0.4:
+            # Mode 1: Negative scaling — partially reverses gradient direction
+            lam = np.random.uniform(-1.0, -self.a)
+        elif mode < 0.8:
+            # Mode 2: Amplification — overwhelms honest gradients in FedAvg
+            lam = np.random.uniform(5.0, 10.0)
+        else:
+            # Mode 3: Original paper attenuation
+            lam = np.random.uniform(self.a, 1.0)
         return {name: tensor * lam for name, tensor in update.items()}
 
 
