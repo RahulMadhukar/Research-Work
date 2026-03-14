@@ -10,18 +10,18 @@ Experiments:
   E3  Design Choice Ablation:
       E3-A: CDCFL-II layer ablation (5 variants)
       E3-B: CDCFL-I vs CDCFL-II strategy comparison (+ pBFT)
-  E4  PoW effectiveness (from E2, no new runs)
+  E4  Validation effectiveness (from E2, no new runs)
   E5  Stress test: eps=10%-50%
   E6  Convergence speed (no attack)
   E7  Computational overhead (from E2, no new runs)
 
 Usage:
-    python run_cd_cfl_experiments.py                      # Run everything
-    python run_cd_cfl_experiments.py -e E1                # Specific experiment
-    python run_cd_cfl_experiments.py -d FEMNIST            # Specific dataset
-    python run_cd_cfl_experiments.py -d femnist -a gradient_scaling -e E2
-    python run_cd_cfl_experiments.py --resume Output/cd_cfl/20260305_120000/
-    python run_cd_cfl_experiments.py --dev                 # Dev mode
+    python run_cdcfl_experiments.py                      # Run everything
+    python run_cdcfl_experiments.py -e E1                # Specific experiment
+    python run_cdcfl_experiments.py -d FEMNIST            # Specific dataset
+    python run_cdcfl_experiments.py -d femnist -a gradient_scaling -e E2
+    python run_cdcfl_experiments.py --resume Output/cd_cfl/20260305_120000/
+    python run_cdcfl_experiments.py --dev                 # Dev mode
 """
 
 import os
@@ -35,8 +35,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-from evaluation import EvaluationFramework
-from run_impact_analysis import (
+from evaluation import (
+    EvaluationFramework,
     create_attack_scenario, test_defense_on_scenario,
     run_baseline_evaluation, DATASET_ROUNDS, DATASET_LR, DATASET_BATCH_SIZE,
 )
@@ -46,13 +46,13 @@ from run_impact_analysis import (
 # =============================================================================
 DATASETS = ['FEMNIST', 'Shakespeare', 'Sentiment140']
 ATTACKS = ['gradient_scaling', 'same_value', 'back_gradient']
-ROUNDS = {'FEMNIST': 100, 'Shakespeare': 500, 'Sentiment140': 1000}
+ROUNDS = {'FEMNIST': 1, 'Shakespeare': 500, 'Sentiment140': 1000}
 LR = {'FEMNIST': 0.001, 'Shakespeare': 0.001, 'Sentiment140': 0.005}
 NUM_CLIENTS = 100
-DATASET_FRACTION = 0.5
-EPS_DEFAULT = 0.1
+DATASET_FRACTION = 0.1
+EPS_DEFAULT = 0.4
 ALPHA = 0.4   # aggregation participation fraction
-OMEGA = 0.3   # committee size fraction
+OMEGA = 0.4   # committee size fraction
 OUTPUT_PREFIX = 'cd_cfl'  # output subdirectory (overridden by lightweight wrapper)
 
 # Dev mode overrides
@@ -72,16 +72,59 @@ E6_METHODS = ['fedavg', 'cmfl', 'cmfl_ii', 'cdcfl_i', 'cdcfl_ii']
 
 # CDCFL-II layer ablation variants
 CD_CFL_VARIANTS = {
-    'cdcfl_ii':             {'enable_pow': True,  'enable_filter': True,  'enable_robust': True},
-    'cdcfl_ii_no_pow':      {'enable_pow': False, 'enable_filter': True,  'enable_robust': True},
-    'cdcfl_ii_no_filter':   {'enable_pow': True,  'enable_filter': False, 'enable_robust': True},
-    'cdcfl_ii_no_robust':   {'enable_pow': True,  'enable_filter': True,  'enable_robust': False},
-    'cdcfl_ii_only_robust': {'enable_pow': False, 'enable_filter': False, 'enable_robust': True},
+    'cdcfl_ii':                  {'enable_validation': True,  'enable_filter': True,  'enable_robust': True},
+    'cdcfl_ii_no_validation':    {'enable_validation': False, 'enable_filter': True,  'enable_robust': True},
+    'cdcfl_ii_no_filter':        {'enable_validation': True,  'enable_filter': False, 'enable_robust': True},
+    'cdcfl_ii_no_robust':        {'enable_validation': True,  'enable_filter': True,  'enable_robust': False},
+    'cdcfl_ii_only_robust':      {'enable_validation': False, 'enable_filter': False, 'enable_robust': True},
 }
 
 # E3-B strategy comparison variants
 E3B_VARIANTS = ['cdcfl_i', 'cdcfl_i_pbft', 'cdcfl_ii_no_filter',
-                'cdcfl_ii_no_pow', 'cdcfl_ii']
+                'cdcfl_ii_no_validation', 'cdcfl_ii']
+
+# Validation check ablation experiments (E1-E4 from PoW verification spec)
+# These test incremental addition of validation checks in CDCFL-II
+VALIDATION_ABLATION_CONFIGS = {
+    'val_E1_baseline': {
+        'enable_validation': True,
+        'enable_norm_check': False,
+        'enable_loss_check': False,
+        'enable_nan_check': False,
+        'enable_filter': True,
+        'enable_robust': True,
+    },
+    'val_E2_norm_only': {
+        'enable_validation': True,
+        'enable_norm_check': True,
+        'enable_loss_check': False,
+        'enable_nan_check': False,
+        'enable_filter': True,
+        'enable_robust': True,
+    },
+    'val_E3_norm_loss': {
+        'enable_validation': True,
+        'enable_norm_check': True,
+        'enable_loss_check': True,
+        'enable_nan_check': False,
+        'enable_filter': True,
+        'enable_robust': True,
+    },
+    'val_E4_all_checks': {
+        'enable_validation': True,
+        'enable_norm_check': True,
+        'enable_loss_check': True,
+        'enable_nan_check': True,
+        'enable_filter': True,
+        'enable_robust': True,
+    },
+}
+
+# Consensus type experiments
+CONSENSUS_EXPERIMENTS = {
+    'consensus_pbft': {'consensus_type': 'pbft'},
+    'consensus_pow':  {'consensus_type': 'pow'},
+}
 
 # Display labels and colors for plots
 METHOD_LABELS = {
@@ -90,8 +133,16 @@ METHOD_LABELS = {
     'cmfl': 'CMFL-I', 'cmfl_ii': 'CMFL-II',
     'cdcfl_i': 'CDCFL-I', 'cdcfl_ii': 'CDCFL-II',
     'cdcfl_i_pbft': 'CDCFL-I (pBFT)',
-    'cdcfl_ii_no_pow': 'CDCFL-II - PoW', 'cdcfl_ii_no_filter': 'CDCFL-II - Filter',
+    'cdcfl_ii_no_validation': 'CDCFL-II - Validation', 'cdcfl_ii_no_filter': 'CDCFL-II - Filter',
     'cdcfl_ii_no_robust': 'CDCFL-II - Robust', 'cdcfl_ii_only_robust': 'CDCFL-II only Robust',
+    # Validation ablation (E1-E4)
+    'val_E1_baseline': 'E1: No Checks',
+    'val_E2_norm_only': 'E2: Norm Only',
+    'val_E3_norm_loss': 'E3: Norm+Loss',
+    'val_E4_all_checks': 'E4: All Checks',
+    # Consensus experiments
+    'consensus_pbft': 'CDCFL-I (pBFT)',
+    'consensus_pow': 'CDCFL-I (PoW)',
 }
 METHOD_COLORS = {
     'fedavg': '#1f77b4', 'krum': '#aec7e8', 'multi_krum': '#ffbb78',
@@ -99,17 +150,25 @@ METHOD_COLORS = {
     'cmfl': '#ff7f0e', 'cmfl_ii': '#2ca02c',
     'cdcfl_i': '#d62728', 'cdcfl_ii': '#9467bd',
     'cdcfl_i_pbft': '#e377c2',
-    'cdcfl_ii_no_pow': '#8c564b', 'cdcfl_ii_no_filter': '#bcbd22',
+    'cdcfl_ii_no_validation': '#8c564b', 'cdcfl_ii_no_filter': '#bcbd22',
     'cdcfl_ii_no_robust': '#17becf', 'cdcfl_ii_only_robust': '#7f7f7f',
+    # Validation ablation (E1-E4)
+    'val_E1_baseline': '#c49c94',
+    'val_E2_norm_only': '#f7b6d2',
+    'val_E3_norm_loss': '#c7c7c7',
+    'val_E4_all_checks': '#dbdb8d',
+    # Consensus experiments
+    'consensus_pbft': '#e377c2',
+    'consensus_pow': '#d62728',
 }
 E3A_LABELS = {
-    'cdcfl_ii': 'Full', 'cdcfl_ii_no_pow': '- PoW',
+    'cdcfl_ii': 'Full', 'cdcfl_ii_no_validation': '- Validation',
     'cdcfl_ii_no_filter': '- Filter', 'cdcfl_ii_no_robust': '- Robust',
     'cdcfl_ii_only_robust': 'Only Robust',
 }
 E3B_LABELS = {
     'cdcfl_i': 'CDCFL-I (PoW)', 'cdcfl_i_pbft': 'CDCFL-I (pBFT)',
-    'cdcfl_ii_no_filter': '+ PoW prefilter', 'cdcfl_ii_no_pow': '+ Outlier filter',
+    'cdcfl_ii_no_filter': '+ Validation only', 'cdcfl_ii_no_validation': '+ Outlier filter',
     'cdcfl_ii': 'CDCFL-II (full)',
 }
 
@@ -131,7 +190,11 @@ def run_or_fetch(key, run_fn):
     """Run if not cached."""
     if key in RESULTS_CACHE:
         print(f"  [CACHE HIT] {key[:4]}")
-        return RESULTS_CACHE[key]
+        result = RESULTS_CACHE[key]
+        # Print a summary of the cached result here if you want
+        if result is not None:
+            print(f"    Cached final accuracy: {result.get('final_accuracy', 'N/A')}")
+        return result
     result = run_fn()
     RESULTS_CACHE[key] = result
     return result
@@ -216,7 +279,11 @@ def _resolve_method(method):
     if method == 'cdcfl_i':
         return 'cdcfl_i', {}
     elif method == 'cdcfl_i_pbft':
-        return 'cdcfl_i', {'finalization_method': 'pbft'}
+        return 'cdcfl_i', {'consensus_type': 'pbft'}
+    elif method in VALIDATION_ABLATION_CONFIGS:
+        return 'cdcfl_ii', dict(VALIDATION_ABLATION_CONFIGS[method])
+    elif method in CONSENSUS_EXPERIMENTS:
+        return 'cdcfl_i', dict(CONSENSUS_EXPERIMENTS[method])
     elif method in CD_CFL_VARIANTS:
         return 'cdcfl_ii', dict(CD_CFL_VARIANTS[method])
     else:
@@ -383,7 +450,7 @@ def run_E3(framework, datasets, attacks, rounds_map, fraction, cpr, output_dir):
     # --- E3-B: Strategy Comparison ---
     print("\n" + "="*80)
     print("  E3-B: CDCFL-I vs CDCFL-II Strategy Comparison")
-    print("  (includes PoW vs pBFT finalization test)")
+    print("  (includes PoW vs pBFT consensus finalization test)")
     print("="*80)
 
     for ds in datasets:
@@ -436,9 +503,9 @@ def run_E3(framework, datasets, attacks, rounds_map, fraction, cpr, output_dir):
 
 
 def run_E4(datasets, attacks, rounds_map):
-    """E4: PoW effectiveness analysis (from E2 results, no new runs)."""
+    """E4: Validation effectiveness analysis (from E2 results, no new runs)."""
     print("\n" + "="*80)
-    print("  E4: PoW Effectiveness Analysis")
+    print("  E4: Validation Effectiveness Analysis")
     print("="*80)
     for ds in datasets:
         print(f"\n  {ds}:")
@@ -452,20 +519,20 @@ def run_E4(datasets, attacks, rounds_map):
                 print(f"  {atk:20s} | {'N/A (run E2 first)':>46s}")
                 continue
             det = r.get('detection_metrics', {})
-            norm_r = det.get('pow_norm_rejected', 0)
-            loss_r = det.get('pow_loss_rejected', 0)
-            nan_r  = det.get('pow_nan_rejected', 0)
-            total_r = det.get('pow_total_rejected', norm_r + loss_r + nan_r)
+            norm_r = det.get('validation_norm_rejected', det.get('pow_norm_rejected', 0))
+            loss_r = det.get('validation_loss_rejected', det.get('pow_loss_rejected', 0))
+            nan_r  = det.get('validation_nan_rejected', det.get('pow_nan_rejected', 0))
+            total_r = det.get('validation_total_rejected', det.get('pow_total_rejected', norm_r + loss_r + nan_r))
             print(f"  {atk:20s} | {norm_r:>10} | {loss_r:>10} | {nan_r:>10} | {total_r:>10}")
-    print("\n  Note: PoW rejection counts are cumulative across all rounds.")
+    print("\n  Note: Validation rejection counts are cumulative across all rounds.")
 
 
 def run_E5(framework, datasets, attacks, rounds_map, fraction, cpr, output_dir):
-    """E5: Stress test (eps 10%-50%)."""
+    """E5: Stress test (eps 10%-60%)."""
     print("\n" + "="*80)
-    print("  E5: Stress Test (eps 10%-50%)")
+    print("  E5: Stress Test (eps 10%-60%)")
     print("="*80)
-    epsilons = [0.1, 0.2, 0.3, 0.4, 0.5]
+    epsilons = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
     for ds in datasets:
         rds = rounds_map[ds]
         for method in E5_METHODS:
@@ -532,37 +599,45 @@ def run_E7(datasets, attacks, rounds_map):
     print("\n" + "="*80)
     print("  E7: Computational Overhead")
     print("="*80)
-    methods = ['fedavg', 'cmfl', 'cdcfl_ii']
     for ds in datasets:
         print(f"\n  {ds}:")
-        hdr = f"  {'Method':18s} | {'Total Time':>12s} | {'Time/Round':>12s} | {'PoW':>8s} | {'Filter':>8s} | {'Agg':>8s}"
+        hdr = (f"  {'Method':18s} | {'Total':>10s} | {'Per Round':>10s} | "
+               f"{'Valid':>8s} | {'Filter':>8s} | {'Agg':>8s} | {'Consensus':>10s} | {'Finalize':>10s}")
         print(hdr)
-        print("  " + "-"*78)
+        print("  " + "-"*106)
         rds = rounds_map[ds]
-        for m in methods:
-            found = False
+        for m in E2_METHODS:
+            # Find first available attack result with timing
+            r = None
             for atk in attacks:
                 key = _cache_key(ds, m, atk, EPS_DEFAULT, ALPHA, OMEGA, rds)
                 r = RESULTS_CACHE.get(key)
                 if r and 'total_time' in r:
-                    found = True
                     break
-            if not found:
-                print(f"  {METHOD_LABELS.get(m, m):18s} | {'N/A (run E2 first)':>60s}")
+                r = None
+            if r is None:
+                print(f"  {METHOD_LABELS.get(m, m):18s} | {'N/A (run E2 first)':>84s}")
                 continue
+            total = r['total_time']
             n_rounds = len(r.get('acc_history', [])) or 1
+            per_round = total / n_rounds
             dm = r.get('detection_metrics', {})
-            avg_pow = dm.get('avg_pow_time', 0.0)
+            avg_val = dm.get('avg_validation_time', dm.get('avg_pow_time', 0.0))
             avg_filt = dm.get('avg_filter_time', 0.0)
             avg_agg = dm.get('avg_agg_time', 0.0)
-            if avg_pow > 0 or avg_filt > 0 or avg_agg > 0:
-                total_overhead = (avg_pow + avg_filt + avg_agg) * n_rounds
-                print(f"  {METHOD_LABELS.get(m, m):18s} | {total_overhead:>10.1f}s | "
-                      f"{(total_overhead/n_rounds):>10.3f}s | "
-                      f"{avg_pow:>7.3f}s | {avg_filt:>7.3f}s | {avg_agg:>7.3f}s")
-            else:
-                print(f"  {METHOD_LABELS.get(m, m):18s} |          - |            - |        - |        - |        -")
-    print("\n  Note: PoW/Filter/Agg breakdown only available for CDCFL-II.")
+            avg_cons = dm.get('avg_consensus_time', 0.0)
+            avg_fin = dm.get('avg_finalize_time', 0.0)
+            has_breakdown = (avg_val > 0 or avg_filt > 0 or avg_agg > 0
+                             or avg_cons > 0 or avg_fin > 0)
+            val_s  = f"{avg_val:>7.3f}s" if has_breakdown else f"{'—':>8s}"
+            filt_s = f"{avg_filt:>7.3f}s" if has_breakdown else f"{'—':>8s}"
+            agg_s  = f"{avg_agg:>7.3f}s" if has_breakdown else f"{'—':>8s}"
+            cons_s = f"{avg_cons:>9.3f}s" if avg_cons > 0 else f"{'—':>10s}"
+            fin_s  = f"{avg_fin:>9.3f}s" if avg_fin > 0 else f"{'—':>10s}"
+            print(f"  {METHOD_LABELS.get(m, m):18s} | {total:>9.1f}s | {per_round:>9.3f}s | "
+                  f"{val_s} | {filt_s} | {agg_s} | {cons_s} | {fin_s}")
+    print("\n  Note: Per-layer breakdown available for CDCFL-I (Agg+Consensus+Finalize)")
+    print("        and CDCFL-II (Validation+Filter+Agg). Others show total time only.")
 
 
 # =============================================================================
@@ -713,8 +788,8 @@ def plot_E3B_strategy(rounds_map, datasets, attacks, save_path):
         _save_fig(fig, f"{save_path}_{ds}")
 
 
-def plot_pow_analysis(rounds_map, datasets, attacks, save_path):
-    """E4: Stacked bar chart of PoW rejection breakdown."""
+def plot_validation_analysis(rounds_map, datasets, attacks, save_path):
+    """E4: Stacked bar chart of validation rejection breakdown."""
     ncols = len(datasets)
     fig, axes = plt.subplots(1, ncols, figsize=(5*ncols, 5), squeeze=False)
     for di, ds in enumerate(datasets):
@@ -725,9 +800,9 @@ def plot_pow_analysis(rounds_map, datasets, attacks, save_path):
             key = _cache_key(ds, 'cdcfl_ii', atk, EPS_DEFAULT, ALPHA, OMEGA, rds)
             res = RESULTS_CACHE.get(key)
             dm = res.get('detection_metrics', {}) if res else {}
-            norm_rej.append(dm.get('pow_norm_rejected', 0))
-            loss_rej.append(dm.get('pow_loss_rejected', 0))
-            nan_rej.append(dm.get('pow_nan_rejected', 0))
+            norm_rej.append(dm.get('validation_norm_rejected', dm.get('pow_norm_rejected', 0)))
+            loss_rej.append(dm.get('validation_loss_rejected', dm.get('pow_loss_rejected', 0)))
+            nan_rej.append(dm.get('validation_nan_rejected', dm.get('pow_nan_rejected', 0)))
         x = np.arange(len(attacks))
         ax.bar(x, norm_rej, label='Norm Rejected')
         ax.bar(x, loss_rej, bottom=norm_rej, label='Loss Rejected')
@@ -738,7 +813,7 @@ def plot_pow_analysis(rounds_map, datasets, attacks, save_path):
         ax.set_ylabel('Total Rejections')
         ax.set_title(ds)
         ax.legend(fontsize=7)
-    fig.suptitle('PoW Rejection Breakdown', fontsize=14)
+    fig.suptitle('Validation Rejection Breakdown', fontsize=14)
     fig.tight_layout()
     _save_fig(fig, save_path)
 
@@ -775,14 +850,14 @@ def plot_stress_lines(rounds_map, datasets, attacks, save_path):
 
 
 def plot_overhead_bars(rounds_map, datasets, attacks, save_path):
-    """E7: Computational overhead breakdown."""
-    methods = ['fedavg', 'cmfl', 'cdcfl_ii']
+    """E7: Computational overhead breakdown — stacked bar for all methods."""
+    methods = E2_METHODS
     ncols = len(datasets)
-    fig, axes = plt.subplots(1, ncols, figsize=(5*ncols, 5), squeeze=False)
+    fig, axes = plt.subplots(1, ncols, figsize=(max(8, 2*len(methods))*ncols/2, 6), squeeze=False)
     for di, ds in enumerate(datasets):
         ax = axes[0][di]
         rds = rounds_map[ds]
-        total_times, pow_times, filter_times, agg_times = [], [], [], []
+        total_times, val_times, filter_times, agg_times = [], [], [], []
         for m in methods:
             found = False
             for atk in attacks:
@@ -792,26 +867,26 @@ def plot_overhead_bars(rounds_map, datasets, attacks, save_path):
                     avg_total = res['total_time'] / max(1, rds)
                     total_times.append(avg_total)
                     dm = res.get('detection_metrics', {})
-                    pow_times.append(dm.get('avg_pow_time', 0.0))
+                    val_times.append(dm.get('avg_validation_time', dm.get('avg_pow_time', 0.0)))
                     filter_times.append(dm.get('avg_filter_time', 0.0))
                     agg_times.append(dm.get('avg_agg_time', 0.0))
                     found = True
                     break
             if not found:
                 total_times.append(0)
-                pow_times.append(0)
+                val_times.append(0)
                 filter_times.append(0)
                 agg_times.append(0)
         x = np.arange(len(methods))
-        train_t = [max(0, t-p-f-a) for t, p, f, a in zip(total_times, pow_times, filter_times, agg_times)]
-        ax.bar(x, train_t, label='Training')
-        ax.bar(x, pow_times, bottom=train_t, label='PoW')
-        b2 = [tr+pw for tr, pw in zip(train_t, pow_times)]
-        ax.bar(x, filter_times, bottom=b2, label='Filter')
+        train_t = [max(0, t-v-f-a) for t, v, f, a in zip(total_times, val_times, filter_times, agg_times)]
+        ax.bar(x, train_t, label='Training + Comm', color='#4c72b0')
+        ax.bar(x, val_times, bottom=train_t, label='Validation / Consensus', color='#dd8452')
+        b2 = [tr+vl for tr, vl in zip(train_t, val_times)]
+        ax.bar(x, filter_times, bottom=b2, label='Filter', color='#55a868')
         b3 = [b+f for b, f in zip(b2, filter_times)]
-        ax.bar(x, agg_times, bottom=b3, label='Aggregation')
+        ax.bar(x, agg_times, bottom=b3, label='Aggregation', color='#c44e52')
         ax.set_xticks(x)
-        ax.set_xticklabels([METHOD_LABELS.get(m, m) for m in methods])
+        ax.set_xticklabels([METHOD_LABELS.get(m, m) for m in methods], rotation=35, ha='right', fontsize=7)
         ax.set_ylabel('Avg Time / Round (s)')
         ax.set_title(ds)
         ax.legend(fontsize=7)
@@ -936,12 +1011,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python run_cd_cfl_experiments.py                      # Run everything
-  python run_cd_cfl_experiments.py -e E2                # Specific experiment
-  python run_cd_cfl_experiments.py -d femnist            # Specific dataset
-  python run_cd_cfl_experiments.py -d femnist -a gradient_scaling -e E2
-  python run_cd_cfl_experiments.py --resume Output/cd_cfl/20260305_120000/
-  python run_cd_cfl_experiments.py --dev                 # Dev mode
+  python run_cdcfl_experiments.py                      # Run everything
+  python run_cdcfl_experiments.py -e E2                # Specific experiment
+  python run_cdcfl_experiments.py -d femnist            # Specific dataset
+  python run_cdcfl_experiments.py -d femnist -a gradient_scaling -e E2
+  python run_cdcfl_experiments.py --resume Output/cd_cfl/20260305_120000/
+  python run_cdcfl_experiments.py --dev                 # Dev mode
 """)
     parser.add_argument('-e', '--experiment', type=str, default=None,
                         help='E1-E7 (comma-separated, default: all)')
@@ -1054,7 +1129,7 @@ Examples:
             generate_E3_csv(rounds_map, datasets, attacks, os.path.join(plots_dir, 'E3'))
 
         if 'E4' in run_exps or 'E2' in run_exps:
-            plot_pow_analysis(rounds_map, datasets, attacks, os.path.join(plots_dir, 'E4_pow'))
+            plot_validation_analysis(rounds_map, datasets, attacks, os.path.join(plots_dir, 'E4_validation'))
 
         if 'E5' in run_exps:
             plot_stress_lines(rounds_map, datasets, attacks, os.path.join(plots_dir, 'E5_stress'))

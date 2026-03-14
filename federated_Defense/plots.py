@@ -1741,6 +1741,95 @@ class PlottingEngine:
 
 
 # =====================================================================
+# Detection Analysis Plot (4-panel figure)
+# =====================================================================
+
+def plot_detection_analysis(round_history, output_dir, label='', fmt='png'):
+    """
+    Generate a 4-panel detection analysis figure from round_history.
+
+    Panels:
+      (a) Confusion matrix heatmap (cumulative TP/FP/FN/TN)
+      (b) Recall & Precision over rounds
+      (c) Per-round TP/FP stacked bar chart
+      (d) Recall vs FPR scatter (one dot per round)
+
+    Args:
+        round_history: list of round dicts, each with 'detection_metrics' sub-dict
+        output_dir: directory to save the figure
+        label: string label for the filename (e.g. 'cmfl_femnist_gradient_scaling')
+        fmt: image format ('png', 'eps', 'pdf')
+    """
+    det_rounds = [r['detection_metrics'] for r in round_history
+                  if r.get('detection_metrics') is not None]
+    if not det_rounds:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'Detection Analysis{" — " + label if label else ""}', fontsize=14, y=0.98)
+
+    # --- Panel (a): Confusion matrix heatmap ---
+    ax = axes[0, 0]
+    total_tp = sum(d['tp'] for d in det_rounds)
+    total_fp = sum(d['fp'] for d in det_rounds)
+    total_fn = sum(d['fn'] for d in det_rounds)
+    total_tn = sum(d['tn'] for d in det_rounds)
+    cm = np.array([[total_tp, total_fn], [total_fp, total_tn]])
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                xticklabels=['Pred Mal', 'Pred Ben'],
+                yticklabels=['Act Mal', 'Act Ben'])
+    ax.set_title('(a) Confusion Matrix (cumulative)')
+
+    # --- Panel (b): Recall & Precision over rounds ---
+    ax = axes[0, 1]
+    rounds_x = list(range(1, len(det_rounds) + 1))
+    recalls = [d['recall'] for d in det_rounds]
+    precisions = [d['precision'] for d in det_rounds]
+    f1s = [d['f1_score'] for d in det_rounds]
+    ax.plot(rounds_x, recalls, label='Recall', color='#2196F3', linewidth=1.5)
+    ax.plot(rounds_x, precisions, label='Precision', color='#FF9800', linewidth=1.5)
+    ax.plot(rounds_x, f1s, label='F1', color='#4CAF50', linewidth=1.5, linestyle='--')
+    ax.set_xlabel('Round')
+    ax.set_ylabel('Metric (%)')
+    ax.set_ylim(-5, 105)
+    ax.legend(loc='lower right', fontsize=9)
+    ax.set_title('(b) Recall / Precision / F1 over Rounds')
+
+    # --- Panel (c): TP/FP stacked bar chart ---
+    ax = axes[1, 0]
+    tps = [d['tp'] for d in det_rounds]
+    fps = [d['fp'] for d in det_rounds]
+    ax.bar(rounds_x, tps, label='TP', color='#4CAF50', alpha=0.8)
+    ax.bar(rounds_x, fps, bottom=tps, label='FP', color='#F44336', alpha=0.8)
+    ax.set_xlabel('Round')
+    ax.set_ylabel('Count')
+    ax.legend(loc='upper right', fontsize=9)
+    ax.set_title('(c) TP / FP per Round')
+
+    # --- Panel (d): Recall vs FPR scatter ---
+    ax = axes[1, 1]
+    fprs = [d['fpr'] for d in det_rounds]
+    ax.scatter(fprs, recalls, c=rounds_x, cmap='viridis', s=30, alpha=0.8, edgecolors='k', linewidths=0.5)
+    ax.set_xlabel('FPR (%)')
+    ax.set_ylabel('Recall (%)')
+    ax.set_xlim(-5, 105)
+    ax.set_ylim(-5, 105)
+    # Ideal point
+    ax.scatter([0], [100], marker='*', s=200, c='red', zorder=5, label='Ideal (0% FPR, 100% Recall)')
+    ax.legend(loc='lower right', fontsize=9)
+    ax.set_title('(d) Recall vs FPR (color = round)')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    safe_label = label.replace(' ', '_').replace('/', '_') if label else 'detection'
+    path = os.path.join(output_dir, f'{safe_label}_detection_analysis.{fmt}')
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
+
+# =====================================================================
 # STANDALONE EXECUTION
 # =====================================================================
 

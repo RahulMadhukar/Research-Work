@@ -16,7 +16,7 @@ Usage:
 import run_cdcfl_experiments as exp
 
 # Lightweight overrides
-exp.ROUNDS = {'FEMNIST': 100, 'Shakespeare': 100, 'Sentiment140': 100}
+exp.ROUNDS = {'FEMNIST': 10, 'Shakespeare': 100, 'Sentiment140': 100}
 exp.DATASET_FRACTION = 0.50
 exp.OUTPUT_PREFIX = 'cdcfl_lightweight'
 

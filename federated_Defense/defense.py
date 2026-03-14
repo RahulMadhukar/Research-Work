@@ -13,6 +13,7 @@ Performance Optimizations (v2 - Speed Improvements):
 - Optimized distance metrics (squared L2 instead of L2 with sqrt)
 """
 
+import hashlib
 import numpy as np
 import torch
 from typing import List, Dict, Optional, Tuple
@@ -37,20 +38,16 @@ class PerformanceProfiler:
         self.enabled = False
 
     def enable(self):
-        """Enable profiling."""
         self.enabled = True
 
     def disable(self):
-        """Disable profiling."""
         self.enabled = False
 
     def record(self, operation: str, duration: float):
-        """Record timing for an operation."""
         if self.enabled:
             self.timings[operation].append(duration)
 
     def get_stats(self) -> Dict:
-        """Get profiling statistics."""
         stats = {}
         for op, times in self.timings.items():
             if times:
@@ -65,7 +62,6 @@ class PerformanceProfiler:
         return stats
 
     def print_stats(self):
-        """Print profiling statistics."""
         stats = self.get_stats()
         if not stats:
             print("[PROFILER] No profiling data collected")
@@ -84,7 +80,6 @@ class PerformanceProfiler:
         print("="*80)
 
     def clear(self):
-        """Clear profiling data."""
         self.timings.clear()
 
 
@@ -93,12 +88,10 @@ _profiler = PerformanceProfiler()
 
 
 def get_profiler() -> PerformanceProfiler:
-    """Get the global profiler instance."""
     return _profiler
 
 
 def profile_function(func):
-    """Decorator to profile function execution time."""
     def wrapper(*args, **kwargs):
         if _profiler.enabled:
             start = time.time()
@@ -119,23 +112,6 @@ def detect_nan_inf_updates(client_updates: List[Dict[str, torch.Tensor]],
                            client_ids: Optional[List[int]] = None) -> Tuple[List[Dict[str, torch.Tensor]], List[int], List[int]]:
     """
     Detect and filter out client updates containing NaN or Inf values.
-
-    This is a critical first line of defense against extremely aggressive attacks
-    that cause numerical overflow/underflow in model parameters.
-
-    Args:
-        client_updates: List of client model updates (state dicts)
-        client_ids: Optional list of client IDs (defaults to indices)
-
-    Returns:
-        valid_updates: List of valid client updates (without NaN/Inf)
-        valid_client_ids: List of client IDs for valid updates
-        invalid_client_ids: List of client IDs with NaN/Inf (detected as malicious)
-
-    Example:
-        >>> updates = [client0_update, client1_update, client2_update]
-        >>> valid_updates, valid_ids, invalid_ids = detect_nan_inf_updates(updates)
-        >>> print(f"Detected {len(invalid_ids)} malicious clients with NaN/Inf")
     """
     if client_ids is None:
         client_ids = list(range(len(client_updates)))
@@ -149,48 +125,38 @@ def detect_nan_inf_updates(client_updates: List[Dict[str, torch.Tensor]],
         has_inf = False
         invalid_params = []
 
-        # Check each parameter tensor in the update
         for param_name, param_tensor in update.items():
-            # Convert to tensor if needed
             if not isinstance(param_tensor, torch.Tensor):
                 param_tensor = torch.tensor(param_tensor)
 
-            # Check for NaN
             if torch.isnan(param_tensor).any():
                 has_nan = True
                 invalid_params.append(f"{param_name}:NaN")
 
-            # Check for Inf
             if torch.isinf(param_tensor).any():
                 has_inf = True
                 invalid_params.append(f"{param_name}:Inf")
 
-            # Early exit if invalid detected
             if has_nan or has_inf:
                 break
 
         if has_nan or has_inf:
-            # Mark as malicious - contains invalid values
             invalid_client_ids.append(client_id)
             issue_type = []
             if has_nan:
                 issue_type.append("NaN")
             if has_inf:
                 issue_type.append("Inf")
-
-            print(f"[NaN/Inf DETECTION] ✓ Client {client_id} DETECTED as malicious ({'/'.join(issue_type)} in {invalid_params[0]})")
+            print(f"[NaN/Inf DETECTION] Client {client_id} DETECTED as malicious "
+                  f"({'/'.join(issue_type)} in {invalid_params[0]})")
         else:
-            # Valid update
             valid_updates.append(update)
             valid_client_ids.append(client_id)
 
-    # Summary
     if invalid_client_ids:
         print(f"[NaN/Inf DETECTION] Total detected: {len(invalid_client_ids)}/{len(client_updates)} clients")
 
     return valid_updates, valid_client_ids, invalid_client_ids
-
-
 
 
 # =============================================================================
@@ -198,106 +164,65 @@ def detect_nan_inf_updates(client_updates: List[Dict[str, torch.Tensor]],
 # =============================================================================
 
 class AggregationMethod:
-    """Base class for aggregation methods."""
-
     def aggregate(self, client_updates: List[Dict], weights: Optional[List[float]] = None) -> Dict:
-        """
-        Aggregate client updates.
-
-        Args:
-            client_updates: List of client parameter updates
-            weights: Optional weights for each client
-
-        Returns:
-            Aggregated parameters
-        """
         raise NotImplementedError
 
 
 class FedAvgAggregation(AggregationMethod):
-    """Federated Averaging aggregation."""
-
     def aggregate(self, client_updates: List[Dict], weights: Optional[List[float]] = None) -> Dict:
-        """Weighted average of client updates."""
         n_clients = len(client_updates)
-
         if weights is None:
             weights = [1.0 / n_clients] * n_clients
         else:
-            # Normalize weights
             total_weight = sum(weights)
             weights = [w / total_weight for w in weights]
 
         aggregated_params = {}
         param_names = client_updates[0].keys()
-
         for param_name in param_names:
             weighted_sum = torch.zeros_like(client_updates[0][param_name])
             for update, weight in zip(client_updates, weights):
                 weighted_sum += weight * update[param_name]
             aggregated_params[param_name] = weighted_sum
-
         return aggregated_params
 
 
 class WeightedAverageAggregation(AggregationMethod):
-    """Data-size weighted averaging aggregation.
-
-    Each client's update is weighted by its local dataset size.
-    If no weights are supplied the fallback is uniform (1/n), but the
-    intended use-case always provides explicit data-size weights.
-    """
-
     def aggregate(self, client_updates: List[Dict], weights: Optional[List[float]] = None) -> Dict:
-        """Weighted average of client updates using provided weights."""
         n_clients = len(client_updates)
-
         if weights is None:
             weights = [1.0 / n_clients] * n_clients
         else:
-            # Normalize weights so they sum to 1
             total_weight = sum(weights)
             weights = [w / total_weight for w in weights]
 
         aggregated_params = {}
         param_names = client_updates[0].keys()
-
         for param_name in param_names:
             weighted_sum = torch.zeros_like(client_updates[0][param_name])
             for update, weight in zip(client_updates, weights):
                 weighted_sum += weight * update[param_name]
             aggregated_params[param_name] = weighted_sum
-
         return aggregated_params
 
 
 class KrumAggregation(AggregationMethod):
-    """KRUM aggregation - selects the most representative client."""
-
     def __init__(self, n_attackers: int = 2):
-        """
-        Args:
-            n_attackers: Expected number of malicious clients
-        """
         self.n_attackers = n_attackers
 
     def aggregate(self, client_updates: List[Dict], weights: Optional[List[float]] = None) -> Dict:
-        """Select client with minimum distance sum to closest neighbors."""
         n_clients = len(client_updates)
-        n_select = n_clients - self.n_attackers - 2  # Number of closest neighbors to consider
+        n_select = n_clients - self.n_attackers - 2
 
         if n_select <= 0:
-            # Fallback to FedAvg if too few clients
             return FedAvgAggregation().aggregate(client_updates, weights)
 
-        # Flatten updates to vectors
         vectors = []
         for update in client_updates:
             vec = torch.cat([v.flatten() for v in update.values()]).cpu().numpy()
             vectors.append(vec)
         vectors = np.array(vectors)
 
-        # Compute pairwise distances
         distances = np.zeros((n_clients, n_clients))
         for i in range(n_clients):
             for j in range(i + 1, n_clients):
@@ -305,166 +230,130 @@ class KrumAggregation(AggregationMethod):
                 distances[i, j] = dist
                 distances[j, i] = dist
 
-        # For each client, compute sum of distances to n_select closest neighbors
         scores = []
         for i in range(n_clients):
-            # Get distances to all other clients
             dists = distances[i].copy()
-            dists[i] = float('inf')  # Exclude self
-            # Select n_select smallest distances
+            dists[i] = float('inf')
             closest_dists = np.partition(dists, n_select - 1)[:n_select]
             score = np.sum(closest_dists)
             scores.append(score)
 
-        # Select client with minimum score
         selected_idx = np.argmin(scores)
-
         return client_updates[selected_idx]
 
 
 class MultiKrumAggregation(AggregationMethod):
-    """Multi-Krum aggregation — selects the top-s clients by Krum score and averages them.
-
-    Krum picks the single client whose sum-of-distances to its closest
-    n - f - 2 neighbours is smallest.  Multi-Krum keeps the best *s* clients
-    by that same metric and returns their FedAvg, which is more robust than
-    using just one client while still filtering out outliers.
-    """
-
     def __init__(self, n_attackers: int = 2, s: int = 3):
-        """
-        Args:
-            n_attackers: Expected number of malicious clients (f)
-            s: Number of top-scoring clients to select and average
-        """
         self.n_attackers = n_attackers
         self.s = s
 
     def aggregate(self, client_updates: List[Dict], weights: Optional[List[float]] = None) -> Dict:
-        """Select top-s clients by Krum score, then average their updates."""
         n_clients = len(client_updates)
-        n_neighbors = n_clients - self.n_attackers - 2  # closest neighbours per score
+        n_neighbors = n_clients - self.n_attackers - 2
 
-        if n_neighbors <= 0 or self.s >= n_clients:
-            return FedAvgAggregation().aggregate(client_updates, weights)
-
-        # Flatten each client's update dict into a single vector
         vectors = []
         for update in client_updates:
             vec = torch.cat([v.flatten() for v in update.values()]).cpu().numpy()
             vectors.append(vec)
         vectors = np.array(vectors)
 
-        # Pairwise Euclidean distances
         distances = np.zeros((n_clients, n_clients))
         for i in range(n_clients):
             for j in range(i + 1, n_clients):
-                dist = np.linalg.norm(vectors[i] - vectors[j])
+                dist = np.linalg.norm(vectors[i] - vectors[j]) ** 2
                 distances[i, j] = dist
                 distances[j, i] = dist
 
-        # Krum score for every client: sum of distances to n_neighbors closest peers
         scores = []
         for i in range(n_clients):
             dists = distances[i].copy()
-            dists[i] = float('inf')  # exclude self
+            dists[i] = float('inf')
             closest_dists = np.partition(dists, n_neighbors - 1)[:n_neighbors]
             scores.append(np.sum(closest_dists))
 
-        # Select top-s (lowest scores)
         selected_indices = np.argsort(scores)[:self.s]
-
-        # Average the selected subset
         selected_updates = [client_updates[i] for i in selected_indices]
         return FedAvgAggregation().aggregate(selected_updates)
 
 
 class TrimmedMeanAggregation(AggregationMethod):
-    """Trimmed Mean aggregation - removes extreme values."""
-
     def __init__(self, trim_ratio: float = 0.1):
-        """
-        Args:
-            trim_ratio: Fraction of extreme values to trim from each side
-        """
         self.trim_ratio = trim_ratio
 
     def aggregate(self, client_updates: List[Dict], weights: Optional[List[float]] = None) -> Dict:
-        """Compute trimmed mean by removing extreme values."""
         n_clients = len(client_updates)
         n_trim = int(n_clients * self.trim_ratio)
 
         if n_trim == 0 or n_clients - 2 * n_trim < 1:
-            # Fallback to FedAvg if trimming would leave too few clients
             return FedAvgAggregation().aggregate(client_updates, weights)
 
         aggregated_params = {}
         param_names = client_updates[0].keys()
-
         for param_name in param_names:
-            # Stack all client values for this parameter
             stacked = torch.stack([update[param_name] for update in client_updates])
-
-            # Sort along client dimension and trim extremes
             sorted_vals, _ = torch.sort(stacked, dim=0)
             trimmed = sorted_vals[n_trim:n_clients - n_trim]
-
-            # Compute mean of trimmed values
             aggregated_params[param_name] = torch.mean(trimmed, dim=0)
-
         return aggregated_params
 
 
 class MedianAggregation(AggregationMethod):
-    """Coordinate-wise median aggregation."""
-
     def aggregate(self, client_updates: List[Dict], weights: Optional[List[float]] = None) -> Dict:
-        """Compute coordinate-wise median."""
         aggregated_params = {}
         param_names = client_updates[0].keys()
-
         for param_name in param_names:
-            # Stack all client values for this parameter
             stacked = torch.stack([update[param_name] for update in client_updates])
-
-            # Compute median along client dimension
             aggregated_params[param_name] = torch.median(stacked, dim=0)[0]
-
         return aggregated_params
 
 
 def get_aggregation_method(method_name: str, **kwargs) -> AggregationMethod:
-    """
-    Factory function to create aggregation method.
-
-    Args:
-        method_name: Name of aggregation method ('fedavg', 'krum', 'multi_krum', 'trimmed_mean', 'median')
-        **kwargs: Additional arguments for specific methods
-
-    Returns:
-        AggregationMethod instance
-    """
     method_name = method_name.lower()
-
     if method_name == 'fedavg':
         return FedAvgAggregation()
     elif method_name == 'weighted_avg':
         return WeightedAverageAggregation()
     elif method_name == 'krum':
-        n_attackers = kwargs.get('n_attackers', 2)
-        return KrumAggregation(n_attackers=n_attackers)
+        return KrumAggregation(n_attackers=kwargs.get('n_attackers', 2))
     elif method_name == 'multi_krum':
-        n_attackers = kwargs.get('n_attackers', 2)
-        s = kwargs.get('s', 3)
-        return MultiKrumAggregation(n_attackers=n_attackers, s=s)
+        return MultiKrumAggregation(n_attackers=kwargs.get('n_attackers', 2), s=kwargs.get('s', 3))
     elif method_name == 'trimmed_mean':
-        trim_ratio = kwargs.get('trim_ratio', 0.1)
-        return TrimmedMeanAggregation(trim_ratio=trim_ratio)
+        return TrimmedMeanAggregation(trim_ratio=kwargs.get('trim_ratio', 0.1))
     elif method_name == 'median':
         return MedianAggregation()
     else:
         print(f"[WARN] Unknown aggregation method '{method_name}', using FedAvg")
         return FedAvgAggregation()
+
+
+# =============================================================================
+# Shared gradient summary helper
+# =============================================================================
+
+def _print_grad_summary(tag: str, client_ids: List[int], updates: Dict[int, Dict],
+                        flagged_ids: List[int], threshold: Optional[float] = None):
+    """
+    Print one compact line per client: grad_mean and PASS/FAIL.
+
+    Args:
+        tag:         Prefix label, e.g. '[CMFL]' or '[CDCFL-II]'
+        client_ids:  Ordered list of client IDs to summarise
+        updates:     {client_id: param_dict}
+        flagged_ids: Clients that failed filtering (shown as FAIL)
+        threshold:   Optional threshold value to display in header
+    """
+    header = f"{tag} Gradient norms (training clients)"
+    if threshold is not None:
+        header += f" | threshold={threshold:.6f}"
+    header += ":"
+    print(header)
+    flagged_set = set(flagged_ids)
+    for cid in client_ids:
+        update = updates.get(cid, {})
+        vals = [t.abs().mean().item() for t in update.values() if isinstance(t, torch.Tensor)]
+        gmean = float(np.mean(vals)) if vals else float('nan')
+        status = "FAIL" if cid in flagged_set else "PASS"
+        print(f"  Client {cid:>3} | grad_mean={gmean:.6f} | {status}")
 
 
 # =============================================================================
@@ -487,11 +376,6 @@ class CMFLDefense:
     6. Data-size weighted aggregation (Eq. 5)
     7. Election: middle-ranked training clients become new committee
     8. Step down: old committee moves to idle pool
-
-    Paper parameters (Section 6.1.2):
-        alpha = 0.40  (aggregation participation rate)
-        omega = 0.40  (committee proportion)
-        10% participation per round
     """
 
     def __init__(self, num_clients: int,
@@ -503,90 +387,41 @@ class CMFLDefense:
                  aggregation_participation_frac: float = None,
                  selection_strategy: int = 1,
                  **kwargs):
-        """
-        Initialize CMFL paper-exact defense.
-
-        Args:
-            num_clients: Total number of clients
-            committee_size: C (number of committee members). Auto-scaled if None.
-            training_clients_per_round: n (training clients per round). Auto-scaled if None.
-            committee_rotation_rounds: Rotate committee every N rounds
-            aggregation_method: Aggregation method for selected clients
-            consensus_threshold: pBFT consensus fraction (default 0.5 = majority)
-            aggregation_participation_frac: alpha — fraction of training clients
-                selected for aggregation. Default 0.4 (paper Section 6.1.2).
-            selection_strategy: 1 or 2 (paper Section 4.2.2).
-                Strategy I: Accept top alpha% (high score = close to committee = honest).
-                            For Byzantine attack robustness.
-                Strategy II: Accept bottom alpha% (low score = far from committee).
-                             For convergence acceleration in non-attack scenarios.
-            **kwargs: Absorbed for compatibility (scoring_mode, initial_anomaly_threshold, etc.)
-        """
         self.num_clients = num_clients
-
-        # Initialize aggregation method
         self.aggregation_method = get_aggregation_method(aggregation_method)
-
-        # Paper default: alpha = 0.4 (Section 6.1.2)
         self.aggregation_participation_frac = aggregation_participation_frac if aggregation_participation_frac is not None else 0.4
-
-        # Selection Strategy (paper Section 4.2.2)
         self.selection_strategy = selection_strategy
-
-        # pBFT consensus threshold: floor(C/2) + 1 majority (Section 4.2.4)
         self.consensus_threshold = consensus_threshold
 
-        # Auto-scale committee and training sizes if not provided
         if committee_size is None or training_clients_per_round is None:
-            # Paper: omega = 40% committee proportion (Section 6.1.2)
             total_participation = max(5, min(64, int(num_clients * 0.40)))
             committee_size = max(2, int(total_participation * 0.40))
             training_clients_per_round = total_participation - committee_size
 
-        self.committee_size = min(committee_size, num_clients - 1)  # At least 1 training client
+        self.committee_size = min(committee_size, num_clients - 1)
         self.training_clients_per_round = min(training_clients_per_round,
                                                num_clients - self.committee_size)
         self.committee_rotation_rounds = committee_rotation_rounds
 
-        # Client pools (TRUE committee structure)
         self.committee_members: set = set()
         self.training_clients: set = set()
         self.idle_clients: set = set(range(num_clients))
 
-        # Initialize committee randomly
-        initial_committee = np.random.choice(list(self.idle_clients),
-                                             self.committee_size,
-                                             replace=False)
+        initial_committee = np.random.choice(list(self.idle_clients), self.committee_size, replace=False)
         self.committee_members = set(initial_committee.tolist())
         self.idle_clients -= self.committee_members
 
-        # Tracking
         self.round_count = 0
         self.detected_malicious = set()
         self.committee_history = [sorted(list(self.committee_members))]
-
-        # Per-round detection tracking
         self.detection_history_per_round = []
-
-        # Per-round infiltration tracking: N1 (training), N2 (committee), N3 (aggregation)
         self.infiltration_history = []
-
-        # Verbose logging: set to True for debug, False for speed
         self.verbose = False
 
     def activate_training_clients(self) -> List[int]:
-        """
-        Activate training clients from idle pool (non-committee).
-
-        Paper Section 4.2.1: Select training clients from idle pool.
-        Committee members are NOT in the training set — they score training clients.
-        Both groups train locally, but only training clients' updates are scored.
-        """
         available_idle = list(self.idle_clients)
-
         n_activate = min(self.training_clients_per_round, len(available_idle))
         if n_activate == 0:
-            # Fallback: if no idle clients, use all non-committee clients
             available_idle = [i for i in range(self.num_clients) if i not in self.committee_members]
             n_activate = min(self.training_clients_per_round, len(available_idle))
 
@@ -595,47 +430,25 @@ class CMFLDefense:
         self.idle_clients -= self.training_clients
 
         if self.verbose:
-            print(f"  [ACTIVATE] Training: {sorted(activated)} ({len(activated)} clients)")
-            print(f"  [ACTIVATE] Committee: {sorted(self.committee_members)} ({len(self.committee_members)} members)")
+            print(f"  [ACTIVATE] Training: {sorted(activated)} | Committee: {sorted(self.committee_members)}")
 
         return activated
 
     def committee_scoring(self,
                           training_updates: Dict[int, Dict],
                           committee_updates: Dict[int, Dict]) -> Tuple[Dict[int, float], Dict[int, Dict[int, float]]]:
-        """
-        Paper-exact scoring (Eq. 7-8).
-
-        For each committee member c, for each training client k:
-            P_k^c = 1 / (||g_k - g_c||_2^2 + eps)         (Eq. 7)
-
-        Final score per training client:
-            P_k = C / (sum_c ||g_k - g_c||_2^2 + eps)     (Eq. 8)
-
-        Higher P_k = gradient closer to committee = likely honest.
-
-        Args:
-            training_updates: {client_id: update_dict} for training clients
-            committee_updates: {client_id: update_dict} for committee members
-
-        Returns:
-            (final_scores, per_member_scores) where:
-                final_scores: {training_id: P_k}
-                per_member_scores: {committee_id: {training_id: P_k^c}}
-        """
         training_ids = sorted(training_updates.keys())
         committee_ids = sorted(committee_updates.keys())
         C = len(committee_ids)
         eps = 1e-10
 
-        # Flatten all updates to vectors (as matrices for vectorized cdist)
         training_matrix = []
         for cid in training_ids:
             vec = torch.cat([v.flatten() for v in training_updates[cid].values()]).cpu().numpy()
             if not np.isfinite(vec).all():
                 vec = np.nan_to_num(vec, nan=1e10, posinf=1e10, neginf=-1e10)
             training_matrix.append(vec)
-        training_matrix = np.array(training_matrix)  # shape: (T, d)
+        training_matrix = np.array(training_matrix)
 
         committee_matrix = []
         for cid in committee_ids:
@@ -643,144 +456,78 @@ class CMFLDefense:
             if not np.isfinite(vec).all():
                 vec = np.nan_to_num(vec, nan=1e10, posinf=1e10, neginf=-1e10)
             committee_matrix.append(vec)
-        committee_matrix = np.array(committee_matrix)  # shape: (C, d)
+        committee_matrix = np.array(committee_matrix)
 
-        # Vectorized: compute all pairwise L2 distances at once
-        # dist_matrix shape: (T, C) — dist_matrix[t, c] = ||g_t - g_c||_2
         sq_dist_matrix = cdist(training_matrix, committee_matrix, metric='sqeuclidean')
 
-        # Eq. 7: P_k^c = 1 / (||g_k - g_c||_2^2 + eps) — per-member scores
         per_member_scores = {}
         for c_idx, c_id in enumerate(committee_ids):
             per_member_scores[c_id] = {}
             for t_idx, t_id in enumerate(training_ids):
                 per_member_scores[c_id][t_id] = 1.0 / (sq_dist_matrix[t_idx, c_idx] + eps)
 
-        # Eq. 8: P_k = C / (sum_c ||g_k - g_c||_2^2 + eps) — vectorized
-        sum_sq_distances = sq_dist_matrix.sum(axis=1)  # shape: (T,)
+        sum_sq_distances = sq_dist_matrix.sum(axis=1)
         final_scores = {}
         for t_idx, t_id in enumerate(training_ids):
             final_scores[t_id] = C / (sum_sq_distances[t_idx] + eps)
-
-        if self.verbose:
-            print(f"\n  [SCORING] L2-distance scoring (Eq. 7-8):")
-            for t_id in training_ids:
-                print(f"    Training client {t_id}: P_k = {final_scores[t_id]:.6e}")
 
         return final_scores, per_member_scores
 
     def pbft_consensus(self,
                        final_scores: Dict[int, float],
                        training_client_ids: List[int]) -> Tuple[List[int], List[int]]:
-        """
-        pBFT consensus with Selection Strategy I or II (Section 4.2.2, 4.2.4).
-
-        Selection Strategy I (for attack robustness):
-        - Sort training clients by P_k descending (high score = honest)
-        - Accept top alpha% clients for aggregation
-        - Rejects low-score clients (likely malicious)
-
-        Selection Strategy II (for convergence acceleration):
-        - Sort training clients by P_k descending
-        - Accept bottom alpha% clients for aggregation
-        - Includes low-score clients (diverse gradients aid convergence)
-        - NOT suitable when Byzantine attacks are present
-
-        pBFT consensus (Algorithm 1-2):
-        - Each committee member computes its aggregation set S_a^c
-        - Since all members see the same final P_k scores (Eq. 8),
-          consensus is automatically achieved (all members produce identical sets)
-
-        Args:
-            final_scores: {training_id: P_k} from committee_scoring
-            training_client_ids: List of training client IDs
-
-        Returns:
-            (selected_clients, flagged_clients)
-        """
         n_training = len(training_client_ids)
         alpha = self.aggregation_participation_frac
 
-        # Sort by P_k descending (high score = close to committee = honest)
-        sorted_by_score = sorted(training_client_ids, key=lambda cid: final_scores.get(cid, 0), reverse=True)
-
+        sorted_by_score = sorted(training_client_ids,
+                                 key=lambda cid: final_scores.get(cid, 0), reverse=True)
         n_accept = max(1, int(n_training * alpha))
 
         if self.selection_strategy == 2:
-            # Strategy II: accept bottom alpha% (paper Section 4.2.2)
-            # Low-score clients have diverse gradients → better convergence
             selected_clients = sorted_by_score[-n_accept:]
             flagged_clients = sorted_by_score[:-n_accept]
         else:
-            # Strategy I (default): accept top alpha% (paper Section 4.2.2)
-            # High-score clients are close to committee → likely honest
             selected_clients = sorted_by_score[:n_accept]
             flagged_clients = sorted_by_score[n_accept:]
 
         if self.verbose:
             required_votes = int(np.floor(len(self.committee_members) / 2)) + 1
             strategy_label = "II" if self.selection_strategy == 2 else "I"
-            print(f"\n  [pBFT] Consensus: {len(self.committee_members)}/{len(self.committee_members)} "
-                  f"members agree (required: {required_votes})")
-            print(f"  [SELECTION] Strategy {strategy_label} (alpha={alpha:.0%}): accept {n_accept}/{n_training} clients")
-            print(f"  [SELECTED] {sorted(selected_clients)}")
-            print(f"  [FLAGGED]  {sorted(flagged_clients)}")
+            print(f"  [pBFT] {len(self.committee_members)}/{len(self.committee_members)} agree "
+                  f"(required: {required_votes}) | Strategy {strategy_label} (alpha={alpha:.0%}): "
+                  f"accept {n_accept}/{n_training}")
 
         return selected_clients, flagged_clients
 
     def elect_new_committee(self,
                             training_client_ids: List[int],
                             final_scores: Dict[int, float]) -> List[int]:
-        """
-        Paper-exact committee election (Section 4.2.3).
-
-        "Choose the training client closed to the middle position as the
-        committee clients" — sort by score, pick middle-ranked clients.
-        Excludes bottom (suspicious) and top (too similar / extreme).
-
-        Args:
-            training_client_ids: List of training client IDs
-            final_scores: {training_id: P_k} scores from committee_scoring
-
-        Returns:
-            List of new committee member IDs
-        """
         sorted_by_score = sorted(training_client_ids, key=lambda cid: final_scores.get(cid, 0))
         n = len(sorted_by_score)
 
         if n <= self.committee_size:
-            new_committee = sorted_by_score
-        else:
-            lower_bound = max(0, (n - self.committee_size) // 2)
-            upper_bound = lower_bound + self.committee_size
-            if upper_bound > n:
-                upper_bound = n
-                lower_bound = max(0, upper_bound - self.committee_size)
-            new_committee = sorted_by_score[lower_bound:upper_bound]
+            return sorted_by_score
 
-        return new_committee
+        lower_bound = max(0, (n - self.committee_size) // 2)
+        upper_bound = lower_bound + self.committee_size
+        if upper_bound > n:
+            upper_bound = n
+            lower_bound = max(0, upper_bound - self.committee_size)
+        return sorted_by_score[lower_bound:upper_bound]
 
     def step_down_committee(self):
-        """Move old committee members to idle pool (Paper Section 4.2.3)."""
-        old_committee = list(self.committee_members)
-        self.idle_clients.update(old_committee)
+        self.idle_clients.update(self.committee_members)
         self.committee_members.clear()
 
     def aggregate_selected_clients(self,
                                    selected_client_ids: List[int],
                                    all_updates: Dict[int, Dict],
                                    client_data_sizes: Optional[Dict[int, int]] = None) -> Dict:
-        """Aggregate updates from selected clients using data-size weighted averaging (Eq. 5)."""
         if len(selected_client_ids) == 0:
             raise ValueError("Cannot aggregate with no selected clients")
 
         selected_updates = [all_updates[cid] for cid in selected_client_ids]
-
-        if client_data_sizes:
-            weights = [client_data_sizes.get(cid, 1) for cid in selected_client_ids]
-        else:
-            weights = [1.0] * len(selected_client_ids)
-
+        weights = [client_data_sizes.get(cid, 1) for cid in selected_client_ids] if client_data_sizes else None
         return self.aggregation_method.aggregate(selected_updates, weights)
 
     def cmfl_round(self,
@@ -790,22 +537,9 @@ class CMFLDefense:
                    all_clients: Optional[List] = None,
                    use_anomaly_detection: bool = True,
                    client_data_sizes: Optional[Dict[int, int]] = None) -> Tuple[Dict, List[int], Dict]:
-        """
-        Execute one full CMFL round (Paper Algorithm 3).
-
-        Steps:
-        1. Separate training vs committee updates
-        2. Committee scoring (Eq. 7-8)
-        3. pBFT consensus with Selection Strategy I (top alpha%)
-        4. Aggregate selected clients (Eq. 5, data-size weighted)
-        5. Calculate detection metrics
-        6. Elect new committee + step down on rotation rounds
-        7. Return (aggregated_params, flagged_clients, metrics)
-        """
         self.round_count += 1
         all_client_ids = sorted(client_updates.keys())
 
-        # Step 1: Separate training vs committee updates
         training_ids = [cid for cid in all_client_ids if cid in self.training_clients]
         committee_ids = [cid for cid in all_client_ids if cid in self.committee_members]
 
@@ -813,36 +547,103 @@ class CMFLDefense:
         committee_updates_dict = {cid: client_updates[cid] for cid in committee_ids}
 
         if use_anomaly_detection and len(training_ids) > 0 and len(committee_ids) > 0:
-            # Step 2: Committee scoring (Eq. 7-8)
+            # Committee scoring (Eq. 7-8)
             final_scores, per_member_scores = self.committee_scoring(
                 training_updates, committee_updates_dict
             )
 
-            # Step 3: pBFT consensus — α-based SELECTION for aggregation
+            # pBFT consensus — alpha-based selection for aggregation
             selected_clients, selection_excluded = self.pbft_consensus(
                 final_scores, training_ids
             )
 
-            # Step 3b: Anomaly-based DETECTION (separate from aggregation selection)
-            # Uses L2 distances (inverse of P_k scores) with 2×median threshold.
-            # This decouples "who to exclude from aggregation" (α-based, always
-            # rejects 1-α fraction) from "who is statistically anomalous"
-            # (only flags true outliers with distance > 2× median).
-            #
-            # Why 2×median: robust to small sample sizes (6 training clients),
-            # 0% FP on honest rounds, catches same_value/back_gradient/gradient_scaling.
+            # MAD-based anomaly detection (decoupled from aggregation selection)
             C = len(committee_ids)
             eps = 1e-10
             distances = {cid: C / (final_scores[cid] + eps) for cid in training_ids}
             dist_values = np.array([distances[cid] for cid in training_ids])
             if len(dist_values) >= 2:
                 median_dist = float(np.median(dist_values))
-                anomaly_threshold = 2.0 * median_dist
+                mad = float(np.median(np.abs(dist_values - median_dist)))
+                if mad < 1e-10:
+                    mad = float(np.std(dist_values)) + 1e-10
+                anomaly_threshold = median_dist + 3.0 * mad
                 anomaly_detected = [cid for cid in training_ids
                                     if distances[cid] > anomaly_threshold]
             else:
                 anomaly_detected = []
                 anomaly_threshold = 0.0
+
+            # Committee peer-check (leave-one-out)
+            committee_anomalies = []
+            if len(committee_ids) >= 3:
+                committee_vectors = {}
+                for cid in committee_ids:
+                    vec = torch.cat([p.detach().cpu().flatten()
+                                     for p in committee_updates_dict[cid].values()])
+                    committee_vectors[cid] = vec.numpy()
+                for cid in committee_ids:
+                    peers = [pid for pid in committee_ids if pid != cid]
+                    peer_dists = [float(np.linalg.norm(committee_vectors[cid] - committee_vectors[pid]))
+                                  for pid in peers]
+                    if len(peer_dists) >= 2:
+                        peer_median = float(np.median(peer_dists))
+                        peer_mad = float(np.median(np.abs(np.array(peer_dists) - peer_median)))
+                        if peer_mad < 1e-10:
+                            peer_mad = float(np.std(peer_dists)) + 1e-10
+                        peer_threshold = peer_median + 3.0 * peer_mad
+                        if float(np.mean(peer_dists)) > peer_threshold:
+                            committee_anomalies.append(cid)
+                if committee_anomalies:
+                    anomaly_detected.extend(committee_anomalies)
+
+            # ── Compact gradient summary (replaces verbose raw dump) ──────────
+            _print_grad_summary(
+                tag='[CMFL]',
+                client_ids=training_ids,
+                updates=training_updates,
+                flagged_ids=anomaly_detected,
+                threshold=anomaly_threshold,
+            )
+
+            # ── DETAILED ATTACK SCENARIO LOGGING ──────────────────────────────
+            if malicious_client_ids is not None and len(malicious_client_ids) > 0:
+                print(f"\n[R{self.round_count}] ═══ CMFL-I THRESHOLD & SELECTION ANALYSIS ═══")
+                print(f"  Training clients: {sorted(training_ids)} (count={len(training_ids)})")
+                print(f"  Committee members: {sorted(committee_ids)} (count={len(committee_ids)})")
+                print(f"\n  ─── SCORING RESULTS ───")
+                for cid in sorted(training_ids):
+                    score_val = final_scores.get(cid, 0.0)
+                    dist_val = distances.get(cid, 0.0)
+                    is_mal = " [MALICIOUS]" if cid in malicious_client_ids else ""
+                    print(f"    Client {cid:>2} | Score={score_val:>10.6f} | Distance={dist_val:>10.6f}{is_mal}")
+
+                print(f"\n  ─── THRESHOLD INFORMATION ───")
+                print(f"    Anomaly Threshold (MAD-based): {anomaly_threshold:.6f}")
+                print(f"    Median Distance: {median_dist:.6f}")
+                print(f"    MAD (Median Absolute Deviation): {mad:.6f}")
+                print(f"    Formula: threshold = median + 3.0×MAD = {median_dist:.6f} + 3.0×{mad:.6f}")
+
+                print(f"\n  ─── SELECTION RESULTS ───")
+                print(f"    Selected (Alpha {self.aggregation_participation_frac:.0%}): {sorted(selected_clients)} (count={len(selected_clients)})")
+                print(f"    Excluded (Alpha): {sorted(selection_excluded)} (count={len(selection_excluded)})")
+
+                print(f"\n  ─── ANOMALY DETECTION RESULTS ───")
+                print(f"    Flagged (distance > threshold): {sorted(anomaly_detected)} (count={len(anomaly_detected)})")
+                accepted_by_mad = [cid for cid in training_ids if cid not in anomaly_detected]
+                print(f"    Accepted (distance ≤ threshold): {sorted(accepted_by_mad)} (count={len(accepted_by_mad)})")
+
+                # Check for conflicts
+                conflicts = [cid for cid in selected_clients if cid in anomaly_detected]
+                if conflicts:
+                    print(f"\n  ⚠️  CONFLICT DETECTED: Clients {conflicts} are BOTH selected AND flagged!")
+
+                print(f"\n  ─── USED FOR AGGREGATION ───")
+                print(f"    Final aggregation clients: {sorted(selected_clients)}")
+                for cid in sorted(selected_clients):
+                    is_mal = " [MALICIOUS]" if cid in malicious_client_ids else ""
+                    print(f"      Client {cid}{is_mal}")
+                print()
 
         elif use_anomaly_detection and len(committee_ids) == 0:
             selected_clients = list(training_ids)
@@ -857,7 +658,7 @@ class CMFLDefense:
             final_scores = {}
             anomaly_threshold = 0.0
 
-        # Track N1/N2/N3 infiltration (after selected_clients is known)
+        # Track N1/N2/N3 infiltration
         if all_clients is not None:
             mal_in_training = [cid for cid in training_ids
                                if cid < len(all_clients) and all_clients[cid].is_malicious]
@@ -867,61 +668,50 @@ class CMFLDefense:
                                   if cid < len(all_clients) and all_clients[cid].is_malicious]
             self.infiltration_history.append({
                 'round': self.round_count,
-                # N1: malicious in training set
                 'training_ids': sorted(training_ids),
                 'training_size': len(training_ids),
                 'N1_count': len(mal_in_training),
                 'N1_fraction': len(mal_in_training) / max(1, len(training_ids)),
-                # N2: malicious in committee
                 'committee_members': sorted(self.committee_members),
                 'committee_size': len(self.committee_members),
                 'N2_count': len(mal_in_committee),
                 'N2_fraction': len(mal_in_committee) / max(1, len(self.committee_members)),
-                # N3: malicious in aggregation set (selected by scoring)
                 'selected_clients': sorted(selected_clients),
                 'aggregation_size': len(selected_clients),
                 'N3_count': len(mal_in_aggregation),
                 'N3_fraction': len(mal_in_aggregation) / max(1, len(selected_clients)),
             })
 
-        # Track cumulative detected malicious (anomaly-based, not α-based)
         for cid in anomaly_detected:
             self.detected_malicious.add(cid)
 
-        # Step 4: Aggregate selected clients (Eq. 5, data-size weighted)
-        # Aggregation uses α-based selected_clients (unchanged behavior)
         aggregated_params = self.aggregate_selected_clients(
             selected_clients, client_updates, client_data_sizes=client_data_sizes
         )
 
-        # Step 5: Detection metrics (using anomaly-detected, not α-excluded)
+        participant_snapshot = sorted(training_ids)
         detection_metrics_dict = None
         if all_clients is not None and use_anomaly_detection:
-            round_metrics = self.calculate_round_detection_metrics(
-                all_clients, round_num=self.round_count, flagged_this_round=anomaly_detected
+            detection_metrics_dict = self.calculate_round_detection_metrics(
+                all_clients, round_num=self.round_count,
+                flagged_this_round=anomaly_detected,
+                participant_ids=participant_snapshot
             )
-            detection_metrics_dict = round_metrics
 
-        # Step 6 & 7: Committee rotation (election + step down)
+        # Committee rotation
         if self.round_count % self.committee_rotation_rounds == 0 and len(training_ids) > 0:
-            # Elect new committee from middle-ranked training clients (Section 4.2.3)
             new_committee = self.elect_new_committee(training_ids, final_scores)
-            # Step down old committee → idle
             self.step_down_committee()
-            # Install new committee
             self.committee_members = set(new_committee)
             self.idle_clients -= self.committee_members
-            # Non-elected training clients → idle
             non_elected = self.training_clients - self.committee_members
             self.idle_clients.update(non_elected)
             self.training_clients.clear()
             self.committee_history.append(sorted(list(self.committee_members)))
         else:
-            # No rotation: training clients return to idle
             self.idle_clients.update(self.training_clients)
             self.training_clients.clear()
 
-        # Metrics
         metrics = {
             'round': self.round_count,
             'training_clients': sorted(training_ids),
@@ -938,18 +728,9 @@ class CMFLDefense:
         if detection_metrics_dict is not None:
             metrics['detection_metrics'] = detection_metrics_dict
 
-        # Return anomaly_detected (not selection_excluded) for coordinator detection
         return aggregated_params, anomaly_detected, metrics
 
     def get_infiltration_summary(self):
-        """Summarize N1/N2/N3 infiltration tracking across all rounds.
-
-        N1 = malicious in training set, N2 = malicious in committee,
-        N3 = malicious in aggregation set (selected by scoring).
-
-        Returns:
-            dict with per-round history and aggregate statistics for N1/N2/N3.
-        """
         history = self.infiltration_history
         empty = {
             'per_round': [], 'total_rounds': 0,
@@ -961,7 +742,6 @@ class CMFLDefense:
             'avg_N3_count': 0.0, 'avg_N3_fraction': 0.0,
             'max_N3_count': 0, 'max_N3_fraction': 0.0,
             'rounds_with_N3': 0, 'rounds_with_N3_fraction': 0.0,
-            # Backward-compatible aliases (N2)
             'avg_malicious_count': 0.0, 'avg_malicious_fraction': 0.0,
             'max_malicious_count': 0, 'max_malicious_fraction': 0.0,
             'rounds_with_malicious': 0, 'rounds_with_malicious_fraction': 0.0,
@@ -986,57 +766,46 @@ class CMFLDefense:
         result.update(_stats('N1_count', 'N1_fraction'))
         result.update(_stats('N2_count', 'N2_fraction'))
         result.update(_stats('N3_count', 'N3_fraction'))
-
-        # Backward-compatible aliases (N2 = committee)
         result['avg_malicious_count'] = result['avg_N2_count']
         result['avg_malicious_fraction'] = result['avg_N2_fraction']
         result['max_malicious_count'] = result['max_N2_count']
         result['max_malicious_fraction'] = result['max_N2_fraction']
         result['rounds_with_malicious'] = result['rounds_with_N2']
         result['rounds_with_malicious_fraction'] = result['rounds_with_N2_fraction']
-
         return result
 
     def get_malicious_in_committee_summary(self):
-        """Backward-compatible alias for get_infiltration_summary()."""
         return self.get_infiltration_summary()
 
-    # =========================================================================
-    # Detection Metric Methods (simple per-round)
-    # =========================================================================
-
     def calculate_round_detection_metrics(self, all_clients: List, round_num: int = 0,
-                                          flagged_this_round: Optional[List[int]] = None):
-        """
-        Calculate and store detection metrics for a single round.
-
-        Args:
-            all_clients: List of all client objects (to check is_malicious attribute)
-            round_num: Current round number
-            flagged_this_round: List of client IDs flagged in THIS round.
-                               If None, falls back to cumulative detections.
-        """
-        participants = list(self.training_clients | self.committee_members)
-
-        malicious_participants = [
-            cid for cid in participants
-            if cid < len(all_clients) and getattr(all_clients[cid], 'is_malicious', False)
-        ]
-        benign_participants = [
-            cid for cid in participants
-            if cid < len(all_clients) and not getattr(all_clients[cid], 'is_malicious', False)
-        ]
-
-        if flagged_this_round is not None:
-            detected_ids = flagged_this_round
+                                          flagged_this_round: Optional[List[int]] = None,
+                                          participant_ids: Optional[List[int]] = None):
+        if participant_ids is not None:
+            participants = list(participant_ids)
         else:
-            detected_ids = list(self.detected_malicious)
+            participants = list(self.training_clients)
 
-        tp = len([cid for cid in malicious_participants if cid in detected_ids])
-        fp = len([cid for cid in benign_participants if cid in detected_ids])
-        fn = len([cid for cid in malicious_participants if cid not in detected_ids])
-        tn = len([cid for cid in benign_participants if cid not in detected_ids])
+        detected_ids = set(flagged_this_round) if flagged_this_round is not None else set(self.detected_malicious)
+
+        tp = fp = tn = fn = 0
+        for cid in participants:
+            if cid >= len(all_clients):
+                continue
+            is_malicious = getattr(all_clients[cid], 'is_malicious', False)
+            is_rejected = cid in detected_ids
+            if is_malicious and is_rejected:
+                tp += 1
+            elif is_malicious and not is_rejected:
+                fn += 1
+            elif not is_malicious and is_rejected:
+                fp += 1
+            else:
+                tn += 1
         total = tp + fp + fn + tn
+
+        if total != len(participants):
+            print(f"[R{round_num}] WARNING: Detection count mismatch: "
+                  f"TP+FP+TN+FN={total} != participants={len(participants)}")
 
         precision = (tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
         recall = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
@@ -1050,28 +819,1098 @@ class CMFLDefense:
             'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
             'precision': precision, 'recall': recall,
             'f1_score': f1_score, 'fpr': fpr, 'fnr': fnr, 'dacc': dacc,
-            'num_participants': len(participants),
-            'num_malicious': len(malicious_participants),
-            'num_benign': len(benign_participants),
+            'num_participants': total,
+            'num_malicious': tp + fn,
+            'num_benign': fp + tn,
         }
-
         self.detection_history_per_round.append(round_metrics)
         return round_metrics
 
+
+# =============================================================================
+# CD-CFL Defense (CDCFL-I and CDCFL-II)
+# =============================================================================
+
+class CDCFLDefense:
+    """
+    CD-CFL Defense-in-Depth for Decentralized FL.
+
+    CDCFL-II: Validation -> Outlier Filter -> Robust Agg + Consensus (pBFT/PoW)
+    CDCFL-I:  Robust Agg (all gradients) -> Consensus (pBFT/PoW)
+    """
+
+    def __init__(self, num_clients: int,
+                 committee_size: int = None,
+                 training_clients_per_round: int = None,
+                 committee_rotation_rounds: int = 1,
+                 aggregation_method: str = 'multi_krum',
+                 robust_agg_method: str = None,
+                 consensus_threshold: float = 0.5,
+                 aggregation_participation_frac: float = None,
+                 selection_strategy: int = 1,
+                 norm_lower_factor: float = 0.25,
+                 norm_upper_factor: float = 4.0,
+                 loss_descent_delta: float = 0.05,
+                 mad_multiplier: float = 3.0,
+                 enable_validation: bool = True,
+                 enable_norm_check: bool = True,
+                 enable_loss_check: bool = True,
+                 enable_nan_check: bool = True,
+                 enable_filter: bool = True,
+                 enable_robust: bool = True,
+                 consensus_type: str = 'pow',
+                 max_nonce_trials: int = 5000,
+                 pow_difficulty: str = '000',
+                 **kwargs):
+        self.num_clients = num_clients
+
+        agg_name = robust_agg_method or aggregation_method or 'multi_krum'
+        if not enable_robust:
+            self.aggregation_method = FedAvgAggregation()
+            self._agg_name = 'fedavg'
+        else:
+            self.aggregation_method = get_aggregation_method(agg_name)
+            self._agg_name = agg_name
+
+        self.aggregation_participation_frac = aggregation_participation_frac if aggregation_participation_frac is not None else 0.4
+        self.selection_strategy = selection_strategy
+        self.consensus_threshold = consensus_threshold
+
+        if committee_size is None or training_clients_per_round is None:
+            total_participation = max(5, min(64, int(num_clients * 0.40)))
+            committee_size = max(2, int(total_participation * 0.40))
+            training_clients_per_round = total_participation - committee_size
+
+        self.committee_size = min(committee_size, num_clients - 1)
+        self.training_clients_per_round = min(training_clients_per_round,
+                                               num_clients - self.committee_size)
+        self.committee_rotation_rounds = committee_rotation_rounds
+
+        self.committee_members: set = set()
+        self.training_clients: set = set()
+        self.idle_clients: set = set(range(num_clients))
+
+        initial_committee = np.random.choice(list(self.idle_clients), self.committee_size, replace=False)
+        self.committee_members = set(initial_committee.tolist())
+        self.idle_clients -= self.committee_members
+
+        self.round_count = 0
+        self.detected_malicious = set()
+        self.committee_history = [sorted(list(self.committee_members))]
+
+        self.norm_lower_factor = norm_lower_factor
+        self.norm_upper_factor = norm_upper_factor
+        self.loss_descent_delta = loss_descent_delta
+        self.mad_multiplier = mad_multiplier
+
+        self.enable_validation = enable_validation
+        self.enable_norm_check = enable_norm_check
+        self.enable_loss_check = enable_loss_check
+        self.enable_nan_check = enable_nan_check
+        self.enable_filter = enable_filter
+        self.enable_robust = enable_robust
+        self.consensus_type = consensus_type
+        self.max_nonce_trials = max_nonce_trials
+        self.pow_difficulty = pow_difficulty
+
+        self._previous_block_hash = '0' * 64  # genesis
+
+        self.detection_history_per_round = []
+        self.infiltration_history = []
+        self.validation_rejection_history = []
+        self.filter_rejection_history = []
+        self.pbft_aggregation_history = []
+        self.consensus_history = []
+        self.round_acceptance_history = []
+
+        self.verbose = False
+
+    # =========================================================================
+    # Client pool management
+    # =========================================================================
+
+    def activate_training_clients(self) -> List[int]:
+        available_idle = list(self.idle_clients)
+        n_activate = min(self.training_clients_per_round, len(available_idle))
+        if n_activate == 0:
+            available_idle = [i for i in range(self.num_clients) if i not in self.committee_members]
+            n_activate = min(self.training_clients_per_round, len(available_idle))
+
+        activated = list(np.random.choice(available_idle, n_activate, replace=False))
+        self.training_clients = set(activated)
+        self.idle_clients -= self.training_clients
+        return activated
+
+    def step_down_committee(self):
+        self.idle_clients.update(self.committee_members)
+        self.committee_members.clear()
+
+    # =========================================================================
+    # CDCFL-II: Client Update Validation
+    # =========================================================================
+
+    def validate_client_updates(self, training_updates: Dict[int, Dict],
+                                training_losses_before: Dict[int, float],
+                                training_losses_after: Dict[int, float],
+                                committee_updates: Dict[int, Dict],
+                                global_params: Optional[Dict] = None) -> Tuple[Dict[int, Dict], List[int], Dict]:
+        validation_metrics = {
+            'norm_rejected': [], 'loss_rejected': [], 'nan_rejected': [],
+            'per_client': {}
+        }
+
+        if not self.enable_validation:
+            return training_updates, [], validation_metrics
+
+        has_norm_ref = False
+        norm_lower = norm_upper = 0.0
+        if self.enable_norm_check:
+            committee_norms = []
+            for cid, update in committee_updates.items():
+                delta = {k: update[k] - global_params[k] for k in update if k in global_params} if global_params else update
+                norm = self._compute_update_norm(delta)
+                if np.isfinite(norm) and norm > 0:
+                    committee_norms.append(norm)
+            if committee_norms:
+                median_committee_norm = float(np.median(committee_norms))
+                norm_lower = self.norm_lower_factor * median_committee_norm
+                norm_upper = self.norm_upper_factor * median_committee_norm
+                has_norm_ref = True
+
+        passed_updates = {}
+        failed_ids = []
+
+        for cid, update in training_updates.items():
+            client_metrics = {'norm': 0.0, 'loss_before': 0.0, 'loss_after': 0.0, 'checks_failed': []}
+            rejected = False
+
+            if self.enable_nan_check and not rejected:
+                has_nan = any(
+                    not torch.isfinite(p).all()
+                    for p in update.values()
+                    if isinstance(p, torch.Tensor)
+                )
+                if has_nan:
+                    client_metrics['checks_failed'].append('nan_inf')
+                    validation_metrics['nan_rejected'].append(cid)
+                    rejected = True
+
+            if self.enable_norm_check and has_norm_ref and not rejected:
+                delta = {k: update[k] - global_params[k] for k in update if k in global_params} if global_params else update
+                norm = self._compute_update_norm(delta)
+                client_metrics['norm'] = norm
+                if norm < norm_lower or norm > norm_upper:
+                    client_metrics['checks_failed'].append('norm_bounds')
+                    validation_metrics['norm_rejected'].append(cid)
+                    rejected = True
+
+            if self.enable_loss_check and not rejected:
+                loss_before = training_losses_before.get(cid, None)
+                loss_after = training_losses_after.get(cid, None)
+                client_metrics['loss_before'] = loss_before or 0.0
+                client_metrics['loss_after'] = loss_after or 0.0
+                if loss_before is not None and loss_after is not None:
+                    if loss_after > loss_before * (1 + self.loss_descent_delta):
+                        client_metrics['checks_failed'].append('loss_consistency')
+                        validation_metrics['loss_rejected'].append(cid)
+                        rejected = True
+
+            validation_metrics['per_client'][cid] = client_metrics
+
+            if rejected:
+                failed_ids.append(cid)
+            else:
+                passed_updates[cid] = update
+
+        if len(failed_ids) > 0 and self.verbose:
+            print(f"  [VALIDATION] Rejected {len(failed_ids)}: "
+                  f"norm={len(validation_metrics['norm_rejected'])}, "
+                  f"loss={len(validation_metrics['loss_rejected'])}, "
+                  f"nan={len(validation_metrics['nan_rejected'])}")
+
+        return passed_updates, failed_ids, validation_metrics
+
+    # =========================================================================
+    # CDCFL-II: Committee Statistical Outlier Filter
+    # =========================================================================
+
+    def committee_outlier_filter(self, pow_passed_updates: Dict[int, Dict],
+                                  committee_updates: Dict[int, Dict],
+                                  global_params: Optional[Dict] = None) -> Tuple[List[int], List[int], Dict[int, float]]:
+        training_ids = sorted(pow_passed_updates.keys())
+        committee_ids = sorted(committee_updates.keys())
+
+        if not self.enable_filter or len(committee_ids) == 0 or len(training_ids) == 0:
+            return training_ids, [], {cid: 0.0 for cid in training_ids}
+
+        committee_vectors = []
+        for cid in committee_ids:
+            if global_params is not None:
+                vec = torch.cat([(committee_updates[cid][k] - global_params[k]).flatten().float()
+                                 for k in committee_updates[cid] if k in global_params])
+            else:
+                vec = torch.cat([v.flatten().float() for v in committee_updates[cid].values()])
+            committee_vectors.append(vec)
+        committee_matrix = torch.stack(committee_vectors)
+
+        reference_gradient = torch.median(committee_matrix, dim=0)[0]
+
+        deviation_scores = {}
+        deviations_list = []
+        for cid in training_ids:
+            if global_params is not None:
+                vec = torch.cat([(pow_passed_updates[cid][k] - global_params[k]).flatten().float()
+                                 for k in pow_passed_updates[cid] if k in global_params])
+            else:
+                vec = torch.cat([v.flatten().float() for v in pow_passed_updates[cid].values()])
+            deviation = torch.norm(vec - reference_gradient, p=2).item()
+            deviation_scores[cid] = deviation
+            deviations_list.append(deviation)
+
+        if len(deviations_list) < 2:
+            return training_ids, [], deviation_scores
+
+        # MAD-based adaptive threshold
+        dev_array = np.array(deviations_list)
+        median_dev = float(np.median(dev_array))
+        mad = float(np.median(np.abs(dev_array - median_dev)))
+        threshold = median_dev + self.mad_multiplier * max(mad, 1e-8)
+
+        flagged_ids = []
+        accepted_ids = []
+        for cid in training_ids:
+            if deviation_scores[cid] > threshold:
+                flagged_ids.append(cid)
+            else:
+                accepted_ids.append(cid)
+
+        # ── Compact gradient summary (replaces verbose raw dump) ──────────────
+        _print_grad_summary(
+            tag='[CDCFL-II]',
+            client_ids=training_ids,
+            updates=pow_passed_updates,
+            flagged_ids=flagged_ids,
+            threshold=threshold,
+        )
+
+        if self.verbose and flagged_ids:
+            print(f"  [FILTER] Threshold={threshold:.4f} (median={median_dev:.4f}, MAD={mad:.4f}), "
+                  f"flagged {len(flagged_ids)}/{len(training_ids)}")
+
+        # ── DETAILED ATTACK SCENARIO LOGGING FOR CDCFL-II FILTER ──────────
+        return accepted_ids, flagged_ids, deviation_scores
+
+        return accepted_ids, flagged_ids, deviation_scores
+
+    def committee_consensus_on_outliers(self, flagged_ids_per_member: Dict[int, List[int]]) -> List[int]:
+        if not flagged_ids_per_member:
+            return []
+        C = len(flagged_ids_per_member)
+        majority = C // 2 + 1
+        flag_counts = defaultdict(int)
+        for member_id, flagged_list in flagged_ids_per_member.items():
+            for cid in flagged_list:
+                flag_counts[cid] += 1
+        return [cid for cid, count in flag_counts.items() if count >= majority]
+
+    # =========================================================================
+    # CDCFL-II: Robust Aggregation + pBFT Finalization
+    # =========================================================================
+
+    def robust_aggregate_with_pbft(self,
+                                    accepted_updates: Dict[int, Dict],
+                                    committee_ids: List[int],
+                                    client_data_sizes: Optional[Dict[int, int]] = None) -> Tuple[Dict, Dict]:
+        if len(accepted_updates) == 0:
+            raise ValueError("Cannot aggregate with no accepted clients")
+
+        accepted_ids = sorted(accepted_updates.keys())
+        updates_list = [accepted_updates[cid] for cid in accepted_ids]
+        weights = [client_data_sizes.get(cid, 1) for cid in accepted_ids] if client_data_sizes else None
+        candidate_params = self.aggregation_method.aggregate(updates_list, weights)
+
+        C = len(committee_ids) if committee_ids else 1
+        majority_needed = C // 2 + 1
+
+        pbft_metrics = {
+            'committee_size': C,
+            'majority_needed': majority_needed,
+            'votes_for': C,
+            'consensus_reached': True,
+        }
+        self.pbft_aggregation_history.append({'round': self.round_count, **pbft_metrics})
+        return candidate_params, pbft_metrics
+
+    # =========================================================================
+    # CDCFL-II: Main round method
+    # =========================================================================
+
+    def cdcfl_ii_round(self,
+                       client_updates: Dict[int, Dict],
+                       client_losses_before: Dict[int, float],
+                       client_losses_after: Dict[int, float],
+                       malicious_client_ids: Optional[List[int]] = None,
+                       all_clients: Optional[List] = None,
+                       client_data_sizes: Optional[Dict[int, int]] = None,
+                       test_loader=None,
+                       global_params: Optional[Dict] = None,
+                       model_template=None,
+                       use_anomaly_detection: bool = True) -> Tuple[Dict, List[int], Dict]:
+        self.round_count += 1
+        round_start = time.time()
+        all_client_ids = sorted(client_updates.keys())
+
+        training_ids = [cid for cid in all_client_ids if cid in self.training_clients]
+        committee_ids = [cid for cid in all_client_ids if cid in self.committee_members]
+
+        training_updates = {cid: client_updates[cid] for cid in training_ids}
+        committee_updates_dict = {cid: client_updates[cid] for cid in committee_ids}
+
+        all_flagged = []
+        validation_metrics = {}
+        filter_metrics = {}
+        pbft_agg_metrics = {}
+        deviation_scores = {}
+        t_validation = t_filter = t_agg = t_finalize = 0.0
+        round_accepted = True
+
+        if use_anomaly_detection and len(training_ids) > 0 and len(committee_ids) > 0:
+            # Step 5: Validation
+            t_validation = time.time()
+            validated_updates, validation_failed_ids, validation_metrics = self.validate_client_updates(
+                training_updates,
+                {cid: client_losses_before.get(cid, 0.0) for cid in training_ids},
+                {cid: client_losses_after.get(cid, 0.0) for cid in training_ids},
+                committee_updates_dict,
+                global_params=global_params,
+            )
+            t_validation = time.time() - t_validation
+            all_flagged.extend(validation_failed_ids)
+
+            self.validation_rejection_history.append({
+                'round': self.round_count,
+                'norm_rejected': len(validation_metrics.get('norm_rejected', [])),
+                'loss_rejected': len(validation_metrics.get('loss_rejected', [])),
+                'nan_rejected': len(validation_metrics.get('nan_rejected', [])),
+                'total_rejected': len(validation_failed_ids)
+            })
+
+            # Step 6a: Outlier filter
+            t_filter = time.time()
+            accepted_ids, filter_flagged_ids, deviation_scores = self.committee_outlier_filter(
+                validated_updates, committee_updates_dict, global_params=global_params
+            )
+            t_filter = time.time() - t_filter
+
+            flagged_ids_per_member = {mid: list(filter_flagged_ids) for mid in committee_ids}
+            consensus_flagged = self.committee_consensus_on_outliers(flagged_ids_per_member)
+            all_flagged.extend(consensus_flagged)
+
+            accepted_ids = [cid for cid in accepted_ids if cid not in consensus_flagged]
+            non_consensus_flagged = [cid for cid in filter_flagged_ids if cid not in consensus_flagged]
+            accepted_ids.extend(non_consensus_flagged)
+
+            self.filter_rejection_history.append({
+                'round': self.round_count,
+                'flagged_count': len(consensus_flagged),
+                'threshold_used': 0.0
+            })
+
+            filter_metrics = {
+                'filter_flagged': filter_flagged_ids,
+                'consensus_flagged': consensus_flagged,
+                'accepted_count': len(accepted_ids)
+            }
+
+            # ── DETAILED ATTACK SCENARIO LOGGING FOR CDCFL-II ──────────────────
+            if malicious_client_ids is not None and len(malicious_client_ids) > 0:
+                print(f"\n[R{self.round_count}] ═══ CDCFL-II THRESHOLD & SELECTION ANALYSIS ═══")
+                print(f"  Training clients: {sorted(training_ids)} (count={len(training_ids)})")
+                print(f"  Committee members: {sorted(committee_ids)} (count={len(committee_ids)})")
+
+                print(f"\n  ─── LAYER 1: VALIDATION RESULTS ───")
+                if validation_failed_ids:
+                    print(f"    Rejected clients: {sorted(validation_failed_ids)}")
+                    for cid in sorted(validation_failed_ids):
+                        checks = validation_metrics.get('per_client', {}).get(cid, {}).get('checks_failed', [])
+                        is_mal = " [MALICIOUS]" if cid in malicious_client_ids else ""
+                        print(f"      Client {cid}: {', '.join(checks)}{is_mal}")
+                else:
+                    print(f"    All clients passed validation")
+                print(f"    Validated clients: {sorted(validated_updates.keys())} (count={len(validated_updates)})")
+
+                print(f"\n  ─── LAYER 2: OUTLIER FILTER RESULTS ───")
+                print(f"    Flagged (filter layer): {sorted(filter_flagged_ids)} (count={len(filter_flagged_ids)})")
+                print(f"    Accepted by filter: {sorted(accepted_ids)} (count={len(accepted_ids)})")
+
+                # Get threshold if available (need to recompute for display)
+                if len(deviation_scores) >= 2:
+                    dev_values = np.array([deviation_scores.get(cid, 0.0) for cid in sorted(training_ids)])
+                    median_dev = float(np.median(dev_values))
+                    mad = float(np.median(np.abs(dev_values - median_dev)))
+                    threshold = median_dev + self.mad_multiplier * max(mad, 1e-8)
+                    print(f"    Threshold (MAD-based): {threshold:.6f}")
+                    print(f"      Median deviation: {median_dev:.6f}")
+                    print(f"      MAD: {mad:.6f}")
+                    print(f"      Formula: threshold = median + {self.mad_multiplier}×MAD")
+
+                print(f"\n  ─── FILTER LAYER DETAILS ───")
+                for cid in sorted(training_ids):
+                    if cid in validated_updates:
+                        dev = deviation_scores.get(cid, 0.0)
+                        in_filter = "✓ PASS" if cid not in filter_flagged_ids else "✗ FLAG"
+                        is_mal = " [MALICIOUS]" if cid in malicious_client_ids else ""
+                        print(f"    Client {cid:>2} | Deviation={dev:>10.6f} | {in_filter}{is_mal}")
+
+                print(f"\n  ─── LAYER 3: CONSENSUS RESULTS ───")
+                print(f"    Consensus flagged: {sorted(consensus_flagged)} (count={len(consensus_flagged)})")
+                print(f"    Consensus passed: {[c for c in filter_flagged_ids if c not in consensus_flagged]} (count={len([c for c in filter_flagged_ids if c not in consensus_flagged])})")
+
+                print(f"\n  ─── FINAL AGGREGATION CLIENTS ───")
+                print(f"    Selected for aggregation: {sorted(accepted_ids)} (count={len(accepted_ids)})")
+                for cid in sorted(accepted_ids):
+                    is_mal = " [MALICIOUS]" if cid in malicious_client_ids else ""
+                    print(f"      Client {cid}{is_mal}")
+                print()
+
+            accepted_updates = {cid: client_updates[cid] for cid in accepted_ids if cid in client_updates}
+            if len(accepted_updates) == 0:
+                accepted_updates = committee_updates_dict
+
+            # Step 6b: Robust aggregation (Multi-Krum / configured method)
+            t_agg = time.time()
+            aggregated_params, pbft_agg_metrics = self.robust_aggregate_with_pbft(
+                accepted_updates, committee_ids, client_data_sizes
+            )
+            t_agg = time.time() - t_agg
+            selected_clients = accepted_ids
+
+            # Step 6c: Finalization — PoW or pBFT, controlled by self.consensus_type.
+            # This mirrors CDCFL-I so both variants can be tested independently
+            # by passing consensus_type='pow' or consensus_type='pbft'.
+            t_finalize = time.time()
+            round_accepted = True
+            finalization_metrics = {}
+            if self.consensus_type == 'pbft':
+                final_passed, fin_met = self._pbft_finalize(
+                    aggregated_params, committee_updates_dict
+                )
+                finalization_metrics = fin_met
+            else:  # 'pow'
+                final_passed, _, fin_met = self._pow_finalize(
+                    aggregated_params, self.round_count
+                )
+                fin_met['consensus_type'] = 'pow'
+                finalization_metrics = fin_met
+
+            if not final_passed:
+                round_accepted = False
+                if global_params is not None:
+                    aggregated_params = {k: v.clone() for k, v in global_params.items()}
+
+            t_finalize = time.time() - t_finalize
+
+            pbft_agg_metrics['finalization'] = finalization_metrics
+            pbft_agg_metrics['round_accepted'] = round_accepted
+            pbft_agg_metrics['consensus_type'] = self.consensus_type
+
+            fin_status = "PASSED" if final_passed else "FAILED"
+            print(f"  [CDCFL-II FINALIZE/{self.consensus_type.upper()}] {fin_status}")
+
+        elif use_anomaly_detection and len(committee_ids) == 0:
+            selected_clients = list(training_ids)
+            updates_list = [training_updates[cid] for cid in training_ids]
+            weights = [client_data_sizes.get(cid, 1) for cid in training_ids] if client_data_sizes else None
+            aggregated_params = self.aggregation_method.aggregate(updates_list, weights)
+            deviation_scores = {cid: 0.0 for cid in training_ids}
+        else:
+            selected_clients = list(training_ids)
+            updates_list = [training_updates[cid] for cid in training_ids]
+            weights = [client_data_sizes.get(cid, 1) for cid in training_ids] if client_data_sizes else None
+            aggregated_params = self.aggregation_method.aggregate(updates_list, weights)
+            deviation_scores = {}
+
+        for cid in all_flagged:
+            self.detected_malicious.add(cid)
+
+        # Track N1/N2/N3 infiltration
+        if all_clients is not None:
+            mal_in_training = [cid for cid in training_ids
+                               if cid < len(all_clients) and all_clients[cid].is_malicious]
+            mal_in_committee = [cid for cid in self.committee_members
+                                if cid < len(all_clients) and all_clients[cid].is_malicious]
+            mal_in_aggregation = [cid for cid in selected_clients
+                                  if cid < len(all_clients) and all_clients[cid].is_malicious]
+            self.infiltration_history.append({
+                'round': self.round_count,
+                'training_ids': sorted(training_ids),
+                'training_size': len(training_ids),
+                'N1_count': len(mal_in_training),
+                'N1_fraction': len(mal_in_training) / max(1, len(training_ids)),
+                'committee_members': sorted(self.committee_members),
+                'committee_size': len(self.committee_members),
+                'N2_count': len(mal_in_committee),
+                'N2_fraction': len(mal_in_committee) / max(1, len(self.committee_members)),
+                'selected_clients': sorted(selected_clients),
+                'aggregation_size': len(selected_clients),
+                'N3_count': len(mal_in_aggregation),
+                'N3_fraction': len(mal_in_aggregation) / max(1, len(selected_clients)),
+            })
+
+        participant_snapshot = sorted(training_ids)
+        detection_metrics_dict = None
+        if all_clients is not None and use_anomaly_detection:
+            detection_metrics_dict = self.calculate_round_detection_metrics(
+                all_clients, round_num=self.round_count,
+                flagged_this_round=all_flagged,
+                participant_ids=participant_snapshot
+            )
+
+        # Committee rotation
+        if self.round_count % self.committee_rotation_rounds == 0 and len(training_ids) > 0:
+            scores_for_election = deviation_scores if deviation_scores else {cid: 0.0 for cid in training_ids}
+            new_committee = self.elect_new_committee(training_ids, scores_for_election)
+            self.step_down_committee()
+            self.committee_members = set(new_committee)
+            self.idle_clients -= self.committee_members
+            non_elected = self.training_clients - self.committee_members
+            self.idle_clients.update(non_elected)
+            self.training_clients.clear()
+            self.committee_history.append(sorted(list(self.committee_members)))
+        else:
+            self.idle_clients.update(self.training_clients)
+            self.training_clients.clear()
+
+        round_time = time.time() - round_start
+
+        metrics = {
+            'round': self.round_count,
+            'training_clients': sorted(training_ids),
+            'committee_members': sorted(list(self.committee_members)),
+            'selected_clients': selected_clients,
+            'flagged_clients': all_flagged,
+            'aggregation_clients': selected_clients,
+            'validation_metrics': validation_metrics,
+            'filter_metrics': filter_metrics,
+            'pbft_aggregation': pbft_agg_metrics,
+            'deviation_scores': {k: float(v) for k, v in deviation_scores.items()},
+            'aggregation_method': self._agg_name,
+            'round_time': round_time,
+            'layer_timing': {
+                'validation_time': t_validation,
+                'filter_time': t_filter,
+                'agg_time': t_agg,
+                'finalize_time': t_finalize,
+            },
+            'round_accepted': round_accepted,
+            'consensus_type': self.consensus_type,
+            'layer_counts': {
+                'total_training': len(training_ids),
+                'validation_passed': len(training_ids)
+                                     - len(validation_metrics.get('norm_rejected', []))
+                                     - len(validation_metrics.get('loss_rejected', []))
+                                     - len(validation_metrics.get('nan_rejected', [])),
+                'filter_accepted': len(selected_clients),
+                'final_aggregated': len(selected_clients),
+            },
+            'layers_enabled': {
+                'validation': self.enable_validation,
+                'filter': self.enable_filter,
+                'robust': self.enable_robust,
+            }
+        }
+
+        if detection_metrics_dict is not None:
+            metrics['detection_metrics'] = detection_metrics_dict
+
+        return aggregated_params, all_flagged, metrics
+
+    # =========================================================================
+    # CDCFL-I: Committee Consensus Check
+    # =========================================================================
+
+    def _committee_consensus_check(self, delta_candidate: Dict[str, torch.Tensor],
+                                    committee_updates: Dict[int, Dict[str, torch.Tensor]]
+                                    ) -> Tuple[bool, Dict]:
+        committee_ids = sorted(committee_updates.keys())
+        C = len(committee_ids)
+        if C == 0:
+            return True, {'approve_count': 0, 'required': 0, 'total': 0, 'passed': True, 'per_member_votes': {}}
+
+        required = C // 2 + 1
+        candidate_vec = torch.cat([v.flatten().float() for v in delta_candidate.values()])
+        candidate_norm = torch.norm(candidate_vec, p=2).item()
+
+        per_member_votes = {}
+        approve_count = 0
+
+        for cid in committee_ids:
+            member_vec = torch.cat([v.flatten().float() for v in committee_updates[cid].values()])
+            member_norm = torch.norm(member_vec, p=2).item()
+
+            if candidate_norm > 1e-10 and member_norm > 1e-10:
+                cos_sim = (torch.dot(candidate_vec, member_vec) / (candidate_norm * member_norm)).item()
+            else:
+                cos_sim = 0.0
+
+            norm_ratio = candidate_norm / max(member_norm, 1e-10)
+            approved = cos_sim > -0.5 and 0.1 < norm_ratio < 10.0
+            if approved:
+                approve_count += 1
+
+            per_member_votes[cid] = {
+                'cosine_similarity': float(cos_sim),
+                'norm_ratio': float(norm_ratio),
+                'approved': approved,
+            }
+
+        passed = approve_count >= required
+
+        if self.verbose:
+            status = "PASSED" if passed else "FAILED"
+            print(f"  [CONSENSUS] {approve_count}/{C} approved (required: {required}) — {status}")
+
+        return passed, {
+            'approve_count': approve_count,
+            'required': required,
+            'total': C,
+            'passed': passed,
+            'per_member_votes': per_member_votes,
+        }
+
+    # =========================================================================
+    # CDCFL-I: PoW Finalization
+    # =========================================================================
+
+    def _pow_finalize(self, delta_candidate: Dict[str, torch.Tensor],
+                      round_id: int) -> Tuple[bool, str, Dict]:
+        model_hasher = hashlib.sha256()
+        for name in sorted(delta_candidate.keys()):
+            tensor_bytes = delta_candidate[name].flatten().float().cpu().numpy().tobytes()
+            model_hasher.update(tensor_bytes)
+        aggregated_model_hash = model_hasher.hexdigest()
+
+        timestamp = time.time()
+        previous_block_hash = self._previous_block_hash
+
+        pow_passed = False
+        winning_hash = ''
+        winning_nonce = -1
+
+        for nonce in range(self.max_nonce_trials):
+            block_string = (f"{round_id}{aggregated_model_hash}"
+                            f"{previous_block_hash}{timestamp}{nonce}")
+            block_hash = hashlib.sha256(block_string.encode()).hexdigest()
+            if block_hash.startswith(self.pow_difficulty):
+                pow_passed = True
+                winning_hash = block_hash
+                winning_nonce = nonce
+                break
+
+        if pow_passed:
+            self._previous_block_hash = winning_hash
+
+        return pow_passed, winning_hash, {
+            'nonce': winning_nonce,
+            'hash': winning_hash,
+            'passed': pow_passed,
+            'difficulty': self.pow_difficulty,
+            'trials_used': winning_nonce + 1 if pow_passed else self.max_nonce_trials,
+            'block': {
+                'round_id': round_id,
+                'model_hash': aggregated_model_hash,
+                'previous_hash': previous_block_hash,
+                'timestamp': timestamp,
+            },
+        }
+
+    # =========================================================================
+    # CDCFL-I: pBFT Finalization
+    # =========================================================================
+
+    def _pbft_finalize(self, delta_candidate: Dict[str, torch.Tensor],
+                       committee_updates: Dict[int, Dict[str, torch.Tensor]]
+                       ) -> Tuple[bool, Dict]:
+        consensus_passed, metrics = self._committee_consensus_check(delta_candidate, committee_updates)
+        metrics['consensus_type'] = 'pbft'
+        return consensus_passed, metrics
+
+    # =========================================================================
+    # CDCFL-I: Main round method
+    # =========================================================================
+
+    def cdcfl_i_round(self,
+                      client_updates: Dict[int, Dict],
+                      client_losses_after: Dict[int, float] = None,
+                      malicious_client_ids: Optional[List[int]] = None,
+                      all_clients: Optional[List] = None,
+                      client_data_sizes: Optional[Dict[int, int]] = None,
+                      test_loader=None,
+                      global_params: Optional[Dict] = None,
+                      model_template=None,
+                      use_anomaly_detection: bool = True) -> Tuple[Dict, List[int], Dict]:
+        self.round_count += 1
+        round_start = time.time()
+        all_client_ids = sorted(client_updates.keys())
+
+        training_ids = [cid for cid in all_client_ids if cid in self.training_clients]
+        committee_ids = [cid for cid in all_client_ids if cid in self.committee_members]
+
+        training_updates = {cid: client_updates[cid] for cid in training_ids}
+        committee_updates_dict = {cid: client_updates[cid] for cid in committee_ids}
+
+        round_accepted = True
+        consensus_metrics = {}
+        finalization_metrics = {}
+        contribution_scores = {}
+
+        # Layer 1: Robust aggregation of ALL training gradients
+        t_agg = time.time()
+        updates_list = [training_updates[cid] for cid in training_ids]
+        weights = [client_data_sizes.get(cid, 1) for cid in training_ids] if client_data_sizes else [1.0] * len(updates_list)
+
+        if len(updates_list) > 0:
+            delta_candidate = self.aggregation_method.aggregate(updates_list, weights)
+        elif global_params is not None:
+            delta_candidate = {k: v.clone() for k, v in global_params.items()}
+        else:
+            delta_candidate = client_updates[all_client_ids[0]]
+        t_agg = time.time() - t_agg
+
+        # ── Compact gradient summary for CDCFL-I (all clients pass, no filter) ──
+        if training_ids:
+            _print_grad_summary(
+                tag='[CDCFL-I]',
+                client_ids=training_ids,
+                updates=training_updates,
+                flagged_ids=[],        # CDCFL-I has no per-client filter
+                threshold=None,        # no threshold to display
+            )
+
+        # ── DETAILED ATTACK SCENARIO LOGGING FOR CDCFL-I ──────────────────────
+        if malicious_client_ids is not None and len(malicious_client_ids) > 0:
+            print(f"\n[R{self.round_count}] ═══ CDCFL-I THRESHOLD & SELECTION ANALYSIS ═══")
+            print(f"  Training clients: {sorted(training_ids)} (count={len(training_ids)})")
+            print(f"  Committee members: {sorted(committee_ids)} (count={len(committee_ids)})")
+
+            print(f"\n  ─── CDCFL-I ARCHITECTURE ───")
+            print(f"    Layer 1: Robust Aggregation (NO per-client filtering)")
+            print(f"    Layer 2: Committee Consensus Check")
+            print(f"    Layer 3: Finalization (PoW or pBFT)")
+
+            print(f"\n  ─── AGGREGATION INPUT (ALL CLIENTS) ───")
+            print(f"    All training clients included (no filtering): {sorted(training_ids)}")
+            for cid in sorted(training_ids):
+                is_mal = " [MALICIOUS]" if cid in malicious_client_ids else ""
+                print(f"      Client {cid}{is_mal}")
+            print(f"    Total clients aggregated: {len(training_ids)}")
+            print(f"    Aggregation method: {self._agg_name}")
+
+            print(f"\n  ─── THRESHOLD & FILTERING ───")
+            print(f"    Threshold: None (no per-client filtering)")
+            print(f"    Flagged clients: [] (empty)")
+            print(f"    Strategy: Robust aggregation handles outliers algorithmically")
+
+            print(f"\n  ─── CONSENSUS CHECK RESULTS ───")
+            if consensus_metrics:
+                approve_count = consensus_metrics.get('approve_count', 0)
+                total = consensus_metrics.get('total', 0)
+                required = consensus_metrics.get('required', 0)
+                passed = consensus_metrics.get('passed', False)
+                print(f"    Votes: {approve_count}/{total} (required: {required})")
+                print(f"    Result: {'PASSED' if passed else 'FAILED'}")
+
+            print(f"\n  ─── FINALIZATION RESULTS ───")
+            print(f"    Finalization type: {self.consensus_type.upper()}")
+            print(f"    Round accepted: {'YES' if round_accepted else 'NO'}")
+
+            print(f"\n  ─── FINAL AGGREGATION OUTPUT ───")
+            print(f"    Clients used: {sorted(training_ids)} (count={len(training_ids)})")
+            print(f"    All clients aggregated (none rejected)")
+            print()
+
+
+        # Layer 2: Committee consensus check
+        t_consensus = time.time()
+        if len(committee_ids) > 0 and use_anomaly_detection:
+            consensus_passed, consensus_metrics = self._committee_consensus_check(
+                delta_candidate, committee_updates_dict
+            )
+            if not consensus_passed:
+                round_accepted = False
+                if global_params is not None:
+                    delta_candidate = {k: v.clone() for k, v in global_params.items()}
+        else:
+            consensus_passed = True
+            consensus_metrics = {'approve_count': 0, 'required': 0, 'total': 0, 'passed': True, 'per_member_votes': {}}
+        t_consensus = time.time() - t_consensus
+
+        # Layer 3: Finalization (PoW or pBFT)
+        t_finalize = time.time()
+        if round_accepted:
+            if self.consensus_type == 'pbft':
+                pbft_passed, pbft_metrics = self._pbft_finalize(delta_candidate, committee_updates_dict)
+                final_passed = consensus_passed and pbft_passed
+                finalization_metrics = pbft_metrics
+            else:
+                pow_passed, pow_hash, pow_met = self._pow_finalize(delta_candidate, self.round_count)
+                final_passed = consensus_passed and pow_passed
+                finalization_metrics = pow_met
+                finalization_metrics['consensus_type'] = 'pow'
+
+            if not final_passed:
+                round_accepted = False
+                if global_params is not None:
+                    delta_candidate = {k: v.clone() for k, v in global_params.items()}
+        t_finalize = time.time() - t_finalize
+
+        aggregated_params = delta_candidate
+
+        self.consensus_history.append(consensus_metrics)
+        self.round_acceptance_history.append(round_accepted)
+
+        if consensus_metrics.get('total', 0) > 0:
+            status = "PASSED" if consensus_metrics['passed'] else "FAILED"
+            print(f"  [CONSENSUS] {consensus_metrics['approve_count']}/{consensus_metrics['total']} "
+                  f"approved (required: {consensus_metrics['required']}) — {status}")
+
+        # Contribution scores for committee election
+        if len(training_ids) > 0:
+            candidate_vec = torch.cat([v.flatten().float() for v in aggregated_params.values()])
+            candidate_norm = torch.norm(candidate_vec, p=2).item()
+            for cid in training_ids:
+                member_vec = torch.cat([v.flatten().float() for v in training_updates[cid].values()])
+                member_norm = torch.norm(member_vec, p=2).item()
+                if candidate_norm > 1e-10 and member_norm > 1e-10:
+                    cos = (torch.dot(candidate_vec, member_vec) / (candidate_norm * member_norm)).item()
+                else:
+                    cos = 0.0
+                contribution_scores[cid] = cos
+
+        # Track N1/N2/N3 infiltration
+        if all_clients is not None:
+            mal_in_training = [cid for cid in training_ids
+                               if cid < len(all_clients) and all_clients[cid].is_malicious]
+            mal_in_committee = [cid for cid in self.committee_members
+                                if cid < len(all_clients) and all_clients[cid].is_malicious]
+            self.infiltration_history.append({
+                'round': self.round_count,
+                'training_ids': sorted(training_ids),
+                'training_size': len(training_ids),
+                'N1_count': len(mal_in_training),
+                'N1_fraction': len(mal_in_training) / max(1, len(training_ids)),
+                'committee_members': sorted(self.committee_members),
+                'committee_size': len(self.committee_members),
+                'N2_count': len(mal_in_committee),
+                'N2_fraction': len(mal_in_committee) / max(1, len(self.committee_members)),
+                'selected_clients': sorted(training_ids),
+                'aggregation_size': len(training_ids),
+                'N3_count': len(mal_in_training),
+                'N3_fraction': len(mal_in_training) / max(1, len(training_ids)),
+            })
+
+        # Committee rotation
+        if self.round_count % self.committee_rotation_rounds == 0 and len(training_ids) > 0:
+            deviation_scores = {cid: 1.0 - contribution_scores.get(cid, 0.0) for cid in training_ids}
+            new_committee = self.elect_new_committee(training_ids, deviation_scores)
+            self.step_down_committee()
+            self.committee_members = set(new_committee)
+            self.idle_clients -= self.committee_members
+            non_elected = self.training_clients - self.committee_members
+            self.idle_clients.update(non_elected)
+            self.training_clients.clear()
+            self.committee_history.append(sorted(list(self.committee_members)))
+        else:
+            self.idle_clients.update(self.training_clients)
+            self.training_clients.clear()
+
+        round_time = time.time() - round_start
+
+        metrics = {
+            'round': self.round_count,
+            'strategy': 'CDCFL-I',
+            'training_clients': sorted(training_ids),
+            'committee_members': sorted(list(self.committee_members)),
+            'selected_clients': sorted(training_ids),
+            'flagged_clients': [],
+            'aggregation_clients': sorted(training_ids),
+            'aggregation_method': self._agg_name,
+            'consensus_metrics': consensus_metrics,
+            'finalization_metrics': finalization_metrics,
+            'consensus_type': self.consensus_type,
+            'round_accepted': round_accepted,
+            'contribution_scores': {k: float(v) for k, v in contribution_scores.items()},
+            'round_time': round_time,
+            'layer_timing': {
+                'agg_time': t_agg,
+                'consensus_time': t_consensus,
+                'finalize_time': t_finalize,
+                'pow_time': t_finalize if self.consensus_type == 'pow' else 0.0,
+                'filter_time': 0.0,
+            },
+        }
+
+        return aggregated_params, [], metrics
+
+    # =========================================================================
+    # Committee election
+    # =========================================================================
+
+    def elect_new_committee(self, training_client_ids: List[int],
+                            deviation_scores: Dict[int, float]) -> List[int]:
+        sorted_by_deviation = sorted(training_client_ids,
+                                      key=lambda cid: deviation_scores.get(cid, 0))
+        n = len(sorted_by_deviation)
+
+        if n <= self.committee_size:
+            return sorted_by_deviation
+
+        lower_bound = max(0, (n - self.committee_size) // 2)
+        upper_bound = lower_bound + self.committee_size
+        if upper_bound > n:
+            upper_bound = n
+            lower_bound = max(0, upper_bound - self.committee_size)
+
+        return sorted_by_deviation[lower_bound:upper_bound]
+
+    # =========================================================================
+    # Detection metrics
+    # =========================================================================
+
+    def calculate_round_detection_metrics(self, all_clients: List, round_num: int = 0,
+                                          flagged_this_round: Optional[List[int]] = None,
+                                          participant_ids: Optional[List[int]] = None):
+        participants = list(participant_ids) if participant_ids is not None else list(self.training_clients)
+        detected_ids = set(flagged_this_round) if flagged_this_round is not None else set(self.detected_malicious)
+
+        tp = fp = tn = fn = 0
+        for cid in participants:
+            if cid >= len(all_clients):
+                continue
+            is_malicious = getattr(all_clients[cid], 'is_malicious', False)
+            is_rejected = cid in detected_ids
+            if is_malicious and is_rejected:
+                tp += 1
+            elif is_malicious and not is_rejected:
+                fn += 1
+            elif not is_malicious and is_rejected:
+                fp += 1
+            else:
+                tn += 1
+        total = tp + fp + fn + tn
+
+        if total != len(participants):
+            print(f"[R{round_num}] WARNING: Detection count mismatch: "
+                  f"TP+FP+TN+FN={total} != participants={len(participants)}")
+
+        precision = (tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
+        recall = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
+        f1_score = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        fpr = (fp / (fp + tn) * 100) if (fp + tn) > 0 else 0.0
+        fnr = 100.0 - recall
+        dacc = ((tp + tn) / total * 100) if total > 0 else 0.0
+
+        round_metrics = {
+            'round': round_num,
+            'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
+            'precision': precision, 'recall': recall,
+            'f1_score': f1_score, 'fpr': fpr, 'fnr': fnr, 'dacc': dacc,
+            'num_participants': total,
+            'num_malicious': tp + fn,
+            'num_benign': fp + tn,
+        }
+        self.detection_history_per_round.append(round_metrics)
+        return round_metrics
+
+    def get_infiltration_summary(self):
+        history = self.infiltration_history
+        if not history:
+            return {
+                'per_round': [], 'total_rounds': 0,
+                'avg_N1_count': 0.0, 'avg_N1_fraction': 0.0,
+                'max_N1_count': 0, 'max_N1_fraction': 0.0,
+                'avg_N2_count': 0.0, 'avg_N2_fraction': 0.0,
+                'max_N2_count': 0, 'max_N2_fraction': 0.0,
+                'rounds_with_N2': 0, 'rounds_with_N2_fraction': 0.0,
+                'avg_N3_count': 0.0, 'avg_N3_fraction': 0.0,
+                'max_N3_count': 0, 'max_N3_fraction': 0.0,
+                'rounds_with_N3': 0, 'rounds_with_N3_fraction': 0.0,
+                'avg_malicious_count': 0.0, 'avg_malicious_fraction': 0.0,
+                'max_malicious_count': 0, 'max_malicious_fraction': 0.0,
+                'rounds_with_malicious': 0, 'rounds_with_malicious_fraction': 0.0,
+            }
+
+        def _stats(key_count, key_frac):
+            counts = [r[key_count] for r in history]
+            fracs = [r[key_frac] for r in history]
+            rw = sum(1 for c in counts if c > 0)
+            return {
+                f'avg_{key_count}': float(np.mean(counts)),
+                f'avg_{key_frac}': float(np.mean(fracs)),
+                f'max_{key_count}': int(max(counts)),
+                f'max_{key_frac}': float(max(fracs)),
+                f'rounds_with_{key_count.replace("_count", "")}': rw,
+                f'rounds_with_{key_count.replace("_count", "")}_fraction': rw / len(history),
+            }
+
+        result = {'per_round': history, 'total_rounds': len(history)}
+        result.update(_stats('N1_count', 'N1_fraction'))
+        result.update(_stats('N2_count', 'N2_fraction'))
+        result.update(_stats('N3_count', 'N3_fraction'))
+        result['avg_malicious_count'] = result['avg_N2_count']
+        result['avg_malicious_fraction'] = result['avg_N2_fraction']
+        result['max_malicious_count'] = result['max_N2_count']
+        result['max_malicious_fraction'] = result['max_N2_fraction']
+        result['rounds_with_malicious'] = result['rounds_with_N2']
+        result['rounds_with_malicious_fraction'] = result['rounds_with_N2_fraction']
+        return result
+
+    def get_malicious_in_committee_summary(self):
+        return self.get_infiltration_summary()
+
+    def get_layer_metrics(self) -> Dict:
+        total_norm = sum(r.get('norm_rejected', 0) for r in self.validation_rejection_history)
+        total_loss = sum(r.get('loss_rejected', 0) for r in self.validation_rejection_history)
+        total_nan = sum(r.get('nan_rejected', 0) for r in self.validation_rejection_history)
+        total_validation_rejected = sum(r.get('total_rejected', 0) for r in self.validation_rejection_history)
+        total_filter_flagged = sum(r.get('flagged_count', 0) for r in self.filter_rejection_history)
+
+        return {
+            'validation_norm_rejected': total_norm,
+            'validation_loss_rejected': total_loss,
+            'validation_nan_rejected': total_nan,
+            'validation_total_rejected': total_validation_rejected,
+            'filter_total_flagged': total_filter_flagged,
+            'validation_rejection_per_round': self.validation_rejection_history,
+            'filter_rejection_per_round': self.filter_rejection_history,
+            'pbft_history': self.pbft_aggregation_history,
+            'num_rounds': max(1, self.round_count),
+        }
+
+    # =========================================================================
+    # Utilities
+    # =========================================================================
+
+    def _compute_update_norm(self, update: Dict) -> float:
+        vec = torch.cat([v.flatten().float() for v in update.values()])
+        return torch.norm(vec, p=2).item()
+
+
+# =============================================================================
+# Factory
+# =============================================================================
 
 def get_defense(strategy: str = "cmfl", num_clients: int = 10, **kwargs):
     """
     Factory function to create committee-based defense instances.
 
     Args:
-        strategy: Defense strategy ('cmfl')
+        strategy: 'cmfl', 'cdcfl_i', or 'cdcfl_ii'
         num_clients: Number of clients in the system
-        **kwargs: Additional arguments for specific defenses
-
-    Returns:
-        Defense instance
     """
     if strategy == "cmfl":
         return CMFLDefense(num_clients, **kwargs)
+    elif strategy in ("cdcfl_i", "cdcfl_ii", "cd_cfl"):
+        return CDCFLDefense(num_clients, **kwargs)
     else:
-        raise ValueError(f"Unknown committee defense strategy: {strategy}. Use 'cmfl'.")
+        raise ValueError(f"Unknown defense strategy: {strategy}. Use 'cmfl', 'cdcfl_i', or 'cdcfl_ii'.")
